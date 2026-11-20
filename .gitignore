@@ -1,0 +1,7 @@
+# Google, Samsung and other large binary images: kept locally, never committed
+/images/
+*.img
+*.img.gz
+*.tar
+*.tar.md5
+*.zip

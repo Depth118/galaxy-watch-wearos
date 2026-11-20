@@ -1,0 +1,18 @@
+# SM-R800: stock AOSP sensors HAL 1.0 service (from the Android 9 donor vendor) with
+# sensors.r800.so (SSP sensor hub). It reads the SSP input devices (group input) and
+# writes the hub's enable/poll-delay nodes, which the kernel creates root-owned.
+on boot
+    chown system system /sys/class/sensors/ssp_sensor/enable
+    chown system system /sys/class/sensors/ssp_sensor/accel_poll_delay
+    chown system system /sys/class/sensors/ssp_sensor/gyro_poll_delay
+    chown system system /sys/class/sensors/ssp_sensor/pressure_poll_delay
+    chown system system /sys/class/sensors/ssp_sensor/light_poll_delay
+    chown system system /sys/class/sensors/ssp_sensor/hrm_lib_poll_delay
+    chown system system /sys/class/sensors/ssp_sensor/uncal_gyro_poll_delay
+
+service vendor.sensors-hal-1-0 /vendor/bin/hw/android.hardware.sensors@1.0-service
+    class hal
+    user system
+    group system wakelock input
+    capabilities BLOCK_SUSPEND
+    rlimit rtprio 10 10

@@ -1,0 +1,1048 @@
+/*
+ * sensors.r800.so: legacy sensors HAL for the SM-R800 Wear OS port.
+ *
+ * The sensors sit behind the sensor-hub MCU in the Broadcom BCM47758 (Samsung SSP
+ * over BBD). The kernel SSP driver exposes one input device per sensor and a
+ * control node:
+ *
+ *   /sys/class/sensors/ssp_sensor/enable          bitmask of enabled SSP sensors
+ *   /sys/class/sensors/ssp_sensor/<x>_poll_delay  sampling period in ns
+ *
+ * Every frame carries the values as EV_REL codes followed by a 64-bit boottime
+ * timestamp split over four 16-bit codes. A REL event with value 0 is never
+ * emitted, so missing codes in a frame mean 0 (the driver adds 1 to values that
+ * can legitimately be 0: lux, heart rate).
+ *
+ * Loaded by android.hardware.sensors@1.0-impl (hw_get_module("sensors"),
+ * ro.hardware=r800). Scales are from Tizen's /usr/etc/sensor.xml for the parts
+ * on this board: LSM6DSL (accel 0.244 mg/LSB, gyro 70 mdps/LSB), LPS25H
+ * (pressure raw/4096 hPa), TSL2584 (lux computed by the driver), PPS960 (HR).
+ * Sensors: accelerometer, gyroscope (+ uncalibrated with the hub's bias), barometer,
+ * light, heart rate; wrist tilt, ungaze (wrist down), off-body and step counter /
+ * step detector from the hub's context algorithms.
+ */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/input.h>
+#include <math.h>
+#include <poll.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+#include <android/log.h>
+#include <hardware/hardware.h>
+
+#define LOG_TAG "sensors-r800"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+/* ---- from AOSP hardware/libhardware/include/hardware/sensors.h (stable ABI) ---- */
+#define SENSORS_HARDWARE_MODULE_ID "sensors"
+#define SENSORS_HARDWARE_POLL "poll"
+#define SENSORS_HEADER_VERSION 1
+#define SENSORS_MODULE_API_VERSION_0_1 HARDWARE_MODULE_API_VERSION(0, 1)
+#define SENSORS_DEVICE_API_VERSION_1_3 HARDWARE_DEVICE_API_VERSION_2(1, 3, SENSORS_HEADER_VERSION)
+
+#define SENSOR_TYPE_META_DATA 0
+#define SENSOR_TYPE_ACCELEROMETER 1
+#define SENSOR_TYPE_GYROSCOPE 4
+#define SENSOR_TYPE_LIGHT 5
+#define SENSOR_TYPE_PRESSURE 6
+#define SENSOR_TYPE_GYROSCOPE_UNCALIBRATED 16
+#define SENSOR_TYPE_STEP_DETECTOR 18
+#define SENSOR_TYPE_STEP_COUNTER 19
+#define SENSOR_TYPE_HEART_RATE 21
+#define SENSOR_TYPE_WRIST_TILT_GESTURE 26
+#define SENSOR_TYPE_LOW_LATENCY_OFFBODY_DETECT 34
+#define SENSOR_TYPE_DEVICE_PRIVATE_BASE 0x10000
+/* Wear OS ClockworkAmbient looks this sensor up by string type and turns the
+   screen off when values[0] > 0 ("ungaze": wrist turned away) */
+#define SENSOR_TYPE_UNGAZE (SENSOR_TYPE_DEVICE_PRIVATE_BASE + 1)
+#define SENSOR_STRING_TYPE_UNGAZE "com.google.sensor.ungaze_gesture"
+
+#define SENSOR_STRING_TYPE_ACCELEROMETER "android.sensor.accelerometer"
+#define SENSOR_STRING_TYPE_GYROSCOPE "android.sensor.gyroscope"
+#define SENSOR_STRING_TYPE_LIGHT "android.sensor.light"
+#define SENSOR_STRING_TYPE_PRESSURE "android.sensor.pressure"
+#define SENSOR_STRING_TYPE_GYROSCOPE_UNCALIBRATED "android.sensor.gyroscope_uncalibrated"
+#define SENSOR_STRING_TYPE_HEART_RATE "android.sensor.heart_rate"
+#define SENSOR_STRING_TYPE_STEP_DETECTOR "android.sensor.step_detector"
+#define SENSOR_STRING_TYPE_STEP_COUNTER "android.sensor.step_counter"
+#define SENSOR_STRING_TYPE_WRIST_TILT_GESTURE "android.sensor.wrist_tilt_gesture"
+#define SENSOR_STRING_TYPE_LOW_LATENCY_OFFBODY_DETECT "android.sensor.low_latency_offbody_detect"
+#define SENSOR_PERMISSION_BODY_SENSORS "android.permission.BODY_SENSORS"
+#define SENSOR_PERMISSION_ACTIVITY_RECOGNITION "android.permission.ACTIVITY_RECOGNITION"
+
+#define SENSOR_FLAG_WAKE_UP 1
+#define SENSOR_FLAG_CONTINUOUS_MODE 0
+#define SENSOR_FLAG_ON_CHANGE_MODE 2
+#define SENSOR_FLAG_SPECIAL_REPORTING_MODE 6
+
+#define SENSOR_STATUS_NO_CONTACT -1
+#define SENSOR_STATUS_UNRELIABLE 0
+#define SENSOR_STATUS_ACCURACY_HIGH 3
+
+#define META_DATA_FLUSH_COMPLETE 1
+#define META_DATA_VERSION 0x103
+
+#define GRAVITY_EARTH 9.80665f
+
+typedef struct {
+	union {
+		float v[3];
+		struct {
+			float x, y, z;
+		};
+	};
+	int8_t status;
+	uint8_t reserved[3];
+} sensors_vec_t;
+
+typedef struct {
+	int32_t what;
+	int32_t sensor;
+} meta_data_event_t;
+
+typedef struct {
+	float bpm;
+	int8_t status;
+} heart_rate_event_t;
+
+typedef struct {
+	float uncalib[3];
+	float bias[3];
+} uncalibrated_event_t;
+
+typedef struct sensors_event_t {
+	int32_t version;
+	int32_t sensor;
+	int32_t type;
+	int32_t reserved0;
+	int64_t timestamp;
+	union {
+		union {
+			float data[16];
+			sensors_vec_t acceleration;
+			sensors_vec_t gyro;
+			float light;
+			float pressure;
+			meta_data_event_t meta_data;
+			heart_rate_event_t heart_rate;
+			uncalibrated_event_t uncalibrated_gyro;
+		};
+		union {
+			uint64_t data[8];
+			uint64_t step_counter;
+		} u64;
+	};
+	uint32_t flags;
+	uint32_t reserved1[3];
+} sensors_event_t;
+
+struct sensor_t {
+	const char *name;
+	const char *vendor;
+	int version;
+	int handle;
+	int type;
+	float maxRange;
+	float resolution;
+	float power;
+	int32_t minDelay;
+	uint32_t fifoReservedEventCount;
+	uint32_t fifoMaxEventCount;
+	const char *stringType;
+	const char *requiredPermission;
+#ifdef __LP64__
+	int64_t maxDelay;
+	uint64_t flags;
+#else
+	int32_t maxDelay;
+	uint32_t flags;
+#endif
+	void *reserved[2];
+};
+
+struct sensors_module_t {
+	struct hw_module_t common;
+	int (*get_sensors_list)(struct sensors_module_t *module, struct sensor_t const **list);
+	int (*set_operation_mode)(unsigned int mode);
+};
+
+struct sensors_poll_device_t {
+	struct hw_device_t common;
+	int (*activate)(struct sensors_poll_device_t *dev, int sensor_handle, int enabled);
+	int (*setDelay)(struct sensors_poll_device_t *dev, int sensor_handle, int64_t sampling_period_ns);
+	int (*poll)(struct sensors_poll_device_t *dev, sensors_event_t *data, int count);
+};
+
+typedef struct sensors_poll_device_1 {
+	union {
+		struct sensors_poll_device_t v0;
+		struct {
+			struct hw_device_t common;
+			int (*activate)(struct sensors_poll_device_t *dev, int sensor_handle, int enabled);
+			int (*setDelay)(struct sensors_poll_device_t *dev, int sensor_handle, int64_t sampling_period_ns);
+			int (*poll)(struct sensors_poll_device_t *dev, sensors_event_t *data, int count);
+		};
+	};
+	int (*batch)(struct sensors_poll_device_1 *dev, int sensor_handle, int flags,
+		     int64_t sampling_period_ns, int64_t max_report_latency_ns);
+	int (*flush)(struct sensors_poll_device_1 *dev, int sensor_handle);
+	int (*inject_sensor_data)(struct sensors_poll_device_1 *dev, const sensors_event_t *data);
+	void (*reserved_procs[7])(void);
+} sensors_poll_device_1_t;
+
+_Static_assert(sizeof(sensors_event_t) == 104, "sensors_event_t ABI");
+/* ------------------------------------------------------------------------------ */
+
+#define SSP_SYSFS "/sys/class/sensors/ssp_sensor/"
+
+/* handles; sensor_list[] is in the same order (index = handle - 1) */
+enum { H_ACCEL = 1, H_GYRO, H_PRESSURE, H_LIGHT, H_HR, H_GYRO_UNCAL, H_COUNT };
+/*
+ * Context sensors: computed by the hub's own algorithms (Samsung libsensor-hal,
+ * running inside Tizen's sensord in the /mnt/tz chroot). android-helper.sh runs
+ * `sensorctl test wristup|wristdown|wear_on|pedo` there and writes one line per
+ * event to the CTX_FIFO: "W <us>" for a wrist raise, "D <us>" for a wrist turned
+ * down/away, "O <state>" for wear on (1) / off (2), "P <steps>" with the hub
+ * pedometer's step total (counts from when that sensorctl started; it restarts
+ * from 0 if sensorctl or sensord is restarted).
+ */
+enum { H_WRIST_TILT = H_COUNT, H_OFFBODY, H_UNGAZE, H_STEP_DETECTOR, H_STEP_COUNTER,
+       H_STEP_COUNTER_WAKE, N_HANDLES };
+#define CTX_FIFO "/dev/r800_context"
+
+struct hub_sensor {
+	int handle;
+	const char *input_name;  /* input device name from the SSP driver */
+	int ssp_bit;             /* bit in the enable mask */
+	const char *delay_node;  /* *_poll_delay sysfs node */
+	int ts_code;             /* first of the four timestamp REL codes */
+	int fd;
+	int enabled;
+	int64_t period_ns;
+	int32_t v[6];            /* REL values of the frame being collected */
+	uint16_t ts[4];
+};
+
+static struct hub_sensor hub[H_COUNT] = {
+	[H_ACCEL] = { H_ACCEL, "accelerometer_sensor", 0, "accel_poll_delay", REL_Z + 1, .fd = -1 },
+	[H_GYRO] = { H_GYRO, "gyro_sensor", 1, "gyro_poll_delay", REL_RZ + 1, .fd = -1 },
+	[H_PRESSURE] = { H_PRESSURE, "pressure_sensor", 5, "pressure_poll_delay", REL_WHEEL + 1, .fd = -1 },
+	[H_LIGHT] = { H_LIGHT, "light_sensor", 9, "light_poll_delay", REL_RX + 1, .fd = -1 },
+	[H_HR] = { H_HR, "hrm_lib_sensor", 20, "hrm_lib_poll_delay", REL_Z + 1, .fd = -1 },
+	[H_GYRO_UNCAL] = { H_GYRO_UNCAL, "uncal_gyro_sensor", 14, "uncal_gyro_poll_delay", REL_WHEEL + 1, .fd = -1 },
+};
+
+static const struct sensor_t sensor_list[] = {
+	{ .name = "LSM6DSL Accelerometer", .vendor = "STMicroelectronics", .version = 1,
+	  .handle = H_ACCEL, .type = SENSOR_TYPE_ACCELEROMETER,
+	  .maxRange = 8.0f * GRAVITY_EARTH, .resolution = 0.000244f * GRAVITY_EARTH, .power = 0.25f,
+	  .minDelay = 10000, .stringType = SENSOR_STRING_TYPE_ACCELEROMETER,
+	  .maxDelay = 1000000, .flags = SENSOR_FLAG_CONTINUOUS_MODE },
+	{ .name = "LSM6DSL Gyroscope", .vendor = "STMicroelectronics", .version = 1,
+	  .handle = H_GYRO, .type = SENSOR_TYPE_GYROSCOPE,
+	  .maxRange = 2000.0f * (float)M_PI / 180.0f, .resolution = 0.070f * (float)M_PI / 180.0f,
+	  .power = 0.9f, .minDelay = 10000, .stringType = SENSOR_STRING_TYPE_GYROSCOPE,
+	  .maxDelay = 1000000, .flags = SENSOR_FLAG_CONTINUOUS_MODE },
+	{ .name = "LPS25H Barometer", .vendor = "STMicroelectronics", .version = 1,
+	  .handle = H_PRESSURE, .type = SENSOR_TYPE_PRESSURE,
+	  .maxRange = 1260.0f, .resolution = 1.0f / 4096.0f, .power = 0.03f,
+	  .minDelay = 40000, .stringType = SENSOR_STRING_TYPE_PRESSURE,
+	  .maxDelay = 1000000, .flags = SENSOR_FLAG_CONTINUOUS_MODE },
+	{ .name = "TSL2584 Light", .vendor = "ams", .version = 1,
+	  .handle = H_LIGHT, .type = SENSOR_TYPE_LIGHT,
+	  .maxRange = 60000.0f, .resolution = 1.0f, .power = 0.1f,
+	  .minDelay = 0, .stringType = SENSOR_STRING_TYPE_LIGHT,
+	  .maxDelay = 1000000, .flags = SENSOR_FLAG_ON_CHANGE_MODE },
+	{ .name = "PPS960 Heart Rate", .vendor = "TI", .version = 1,
+	  .handle = H_HR, .type = SENSOR_TYPE_HEART_RATE,
+	  .maxRange = 250.0f, .resolution = 1.0f, .power = 1.0f,
+	  .minDelay = 0, .stringType = SENSOR_STRING_TYPE_HEART_RATE,
+	  .requiredPermission = SENSOR_PERMISSION_BODY_SENSORS,
+	  /* up to 30 min: sensorservice clamps slower requests to maxDelay, and a
+	     slow request is what selects burst mode (see hr_update) */
+	  .maxDelay = 1800000000, .flags = SENSOR_FLAG_ON_CHANGE_MODE },
+	{ .name = "LSM6DSL Gyroscope Uncalibrated", .vendor = "STMicroelectronics", .version = 1,
+	  .handle = H_GYRO_UNCAL, .type = SENSOR_TYPE_GYROSCOPE_UNCALIBRATED,
+	  .maxRange = 2000.0f * (float)M_PI / 180.0f, .resolution = 0.070f * (float)M_PI / 180.0f,
+	  .power = 0.9f, .minDelay = 10000, .stringType = SENSOR_STRING_TYPE_GYROSCOPE_UNCALIBRATED,
+	  .maxDelay = 1000000, .flags = SENSOR_FLAG_CONTINUOUS_MODE },
+	{ .name = "Samsung Wrist Up", .vendor = "Samsung", .version = 1,
+	  .handle = H_WRIST_TILT, .type = SENSOR_TYPE_WRIST_TILT_GESTURE,
+	  .maxRange = 1.0f, .resolution = 1.0f, .power = 0.05f,
+	  .minDelay = 0, .stringType = SENSOR_STRING_TYPE_WRIST_TILT_GESTURE,
+	  .maxDelay = 0, .flags = SENSOR_FLAG_SPECIAL_REPORTING_MODE | SENSOR_FLAG_WAKE_UP },
+	{ .name = "Samsung Wear On/Off", .vendor = "Samsung", .version = 1,
+	  .handle = H_OFFBODY, .type = SENSOR_TYPE_LOW_LATENCY_OFFBODY_DETECT,
+	  .maxRange = 1.0f, .resolution = 1.0f, .power = 0.05f,
+	  .minDelay = 0, .stringType = SENSOR_STRING_TYPE_LOW_LATENCY_OFFBODY_DETECT,
+	  .maxDelay = 0, .flags = SENSOR_FLAG_ON_CHANGE_MODE | SENSOR_FLAG_WAKE_UP },
+	{ .name = "Samsung Wrist Down", .vendor = "Samsung", .version = 1,
+	  .handle = H_UNGAZE, .type = SENSOR_TYPE_UNGAZE,
+	  .maxRange = 1.0f, .resolution = 1.0f, .power = 0.05f,
+	  .minDelay = 0, .stringType = SENSOR_STRING_TYPE_UNGAZE,
+	  .maxDelay = 0, .flags = SENSOR_FLAG_ON_CHANGE_MODE },
+	{ .name = "Samsung Step Detector", .vendor = "Samsung", .version = 1,
+	  .handle = H_STEP_DETECTOR, .type = SENSOR_TYPE_STEP_DETECTOR,
+	  .maxRange = 1.0f, .resolution = 1.0f, .power = 0.05f,
+	  .minDelay = 0, .stringType = SENSOR_STRING_TYPE_STEP_DETECTOR,
+	  .requiredPermission = SENSOR_PERMISSION_ACTIVITY_RECOGNITION,
+	  .maxDelay = 0, .flags = SENSOR_FLAG_SPECIAL_REPORTING_MODE },
+	{ .name = "Samsung Step Counter", .vendor = "Samsung", .version = 1,
+	  .handle = H_STEP_COUNTER, .type = SENSOR_TYPE_STEP_COUNTER,
+	  .maxRange = 4294967295.0f, .resolution = 1.0f, .power = 0.05f,
+	  .minDelay = 0, .stringType = SENSOR_STRING_TYPE_STEP_COUNTER,
+	  .requiredPermission = SENSOR_PERMISSION_ACTIVITY_RECOGNITION,
+	  .maxDelay = 0, .flags = SENSOR_FLAG_ON_CHANGE_MODE },
+	/* same counter as a wake-up sensor: Wear Health Services only takes a
+	   wake-up step counter (getDefaultSensor(19, true)) */
+	{ .name = "Samsung Step Counter (wake-up)", .vendor = "Samsung", .version = 1,
+	  .handle = H_STEP_COUNTER_WAKE, .type = SENSOR_TYPE_STEP_COUNTER,
+	  .maxRange = 4294967295.0f, .resolution = 1.0f, .power = 0.05f,
+	  .minDelay = 0, .stringType = SENSOR_STRING_TYPE_STEP_COUNTER,
+	  .requiredPermission = SENSOR_PERMISSION_ACTIVITY_RECOGNITION,
+	  .maxDelay = 0, .flags = SENSOR_FLAG_ON_CHANGE_MODE | SENSOR_FLAG_WAKE_UP },
+};
+#define N_SENSORS ((int)(sizeof(sensor_list) / sizeof(sensor_list[0])))
+
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static int wake_pipe[2] = { -1, -1 };
+/* pending flush-complete events (by handle), delivered from poll() */
+static int flush_pending[N_HANDLES];
+
+/* context sensor state (lock) */
+static int ctx_enabled[N_HANDLES];
+static float offbody_state = 1.0f;   /* last known: 1 on body, 0 off */
+static int offbody_report;           /* report the current state on next poll */
+/* steps: the counter is monotonic since the HAL started; a smaller hub total
+   means the pedometer restarted from 0, so its last total goes into the base */
+static long long step_raw = -1;      /* last hub total, -1: none yet */
+static uint64_t step_base, step_total;
+static int step_report[N_HANDLES];   /* counter handles: report on next poll */
+static int step_detect_pending;      /* step detector events still to deliver */
+static int ctx_fd = -1, ctx_wfd = -1;
+static char ctx_buf[256];
+static int ctx_len;
+
+/*
+ * Heart rate in bursts. Fit's "Background heart rate" has Play Services record
+ * one sample per 10 min (a 600 s sampling period). Run continuously, the PPG LED
+ * would stay on all day; instead a request at least HR_BG_MIN_NS slow measures
+ * for one burst per period: the hub's HR on until it has a settled reading
+ * (HR_SETTLE_NS after the start, the first non-zero bpm after that), that one
+ * reading reported, the LED off again. No burst while the watch is off the
+ * wrist. A faster client (Fit's manual reading, a workout: 1 s) makes it
+ * continuous; sensorservice passes the fastest request down.
+ * State under lock; hub[H_HR].enabled is the hub's HR bit, hr_active Android's.
+ */
+#define HR_BG_MIN_NS (60LL * 1000000000)
+#define HR_SETTLE_NS (10LL * 1000000000)
+#define HR_BURST_NS (45LL * 1000000000)
+#define HR_MAX_PERIOD_NS (1800LL * 1000000000)
+/* The hub's HR algorithm reports once a second and gives nothing at all when
+   asked for faster: Play Services' samples ask for "fastest" (0 -> 1 ms) */
+#define HR_HUB_PERIOD_NS 1000000000LL
+static int hr_active;          /* Android has the HR sensor enabled */
+static int64_t hr_req_ns;      /* requested sampling period, unclamped */
+static int hr_bg;              /* burst mode */
+static int64_t hr_burst_start; /* 0: no burst running */
+static int64_t hr_next;        /* burst mode: next burst start */
+static int hr_bursts, hr_skipped; /* stats for the log */
+
+static int write_sysfs(const char *node, long long value)
+{
+	char path[128], buf[32];
+	snprintf(path, sizeof(path), SSP_SYSFS "%s", node);
+	int fd = open(path, O_WRONLY | O_CLOEXEC);
+	if (fd < 0) {
+		LOGE("open %s: %s", path, strerror(errno));
+		return -errno;
+	}
+	int n = snprintf(buf, sizeof(buf), "%lld", value);
+	int r = write(fd, buf, n) == n ? 0 : -errno;
+	if (r)
+		LOGE("write %s=%s: %s", path, buf, strerror(-r));
+	close(fd);
+	return r;
+}
+
+static void open_inputs(void)
+{
+	char path[32], name[64];
+	for (int i = 0; i < 64; i++) {
+		snprintf(path, sizeof(path), "/dev/input/event%d", i);
+		int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+		if (fd < 0)
+			continue;
+		if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) < 0) {
+			close(fd);
+			continue;
+		}
+		int used = 0;
+		for (int h = H_ACCEL; h < H_COUNT; h++) {
+			if (hub[h].fd < 0 && !strcmp(name, hub[h].input_name)) {
+				hub[h].fd = fd;
+				used = 1;
+				LOGI("%s -> %s", hub[h].input_name, path);
+			}
+		}
+		if (!used)
+			close(fd);
+	}
+	for (int h = H_ACCEL; h < H_COUNT; h++)
+		if (hub[h].fd < 0)
+			LOGE("no input device %s", hub[h].input_name);
+}
+
+/* caller holds lock */
+/*
+ * The enable mask is shared with Tizen's sensord (chroot), which turns on e.g.
+ * HRM raw (bit 18) for Samsung's wear on/off detection. Only change our own bits:
+ * writing just Android's sensors dropped bit 18 on every light-sensor toggle, the
+ * hub then decided the watch was off the wrist and stopped wrist up/down.
+ */
+static long long read_enable_mask(void)
+{
+	char buf[32] = { 0 };
+	int fd = open(SSP_SYSFS "enable", O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return 0;
+	(void)read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	return strtoll(buf, NULL, 10);
+}
+
+static int apply_enable_mask(void)
+{
+	long long ours = 0, want = 0;
+	for (int h = H_ACCEL; h < H_COUNT; h++) {
+		ours |= 1LL << hub[h].ssp_bit;
+		if (hub[h].enabled)
+			want |= 1LL << hub[h].ssp_bit;
+	}
+	long long mask = (read_enable_mask() & ~ours) | want;
+	return write_sysfs("enable", mask);
+}
+
+static int valid(int handle)
+{
+	return handle >= H_ACCEL && handle < N_HANDLES;
+}
+
+/* caller holds lock */
+static int is_enabled(int handle)
+{
+	if (handle == H_HR)
+		return hr_active; /* the hub's HR is off between bursts */
+	return handle < H_COUNT ? hub[handle].enabled : ctx_enabled[handle];
+}
+
+static void wake_poll(void)
+{
+	char c = 'w';
+	(void)write(wake_pipe[1], &c, 1);
+}
+
+static int64_t now_ns(void);
+
+/* caller holds lock: the hub's HR on or off (its poll delay at most 1 s) */
+static void hr_hub(int on)
+{
+	if (hub[H_HR].enabled == on)
+		return;
+	hub[H_HR].enabled = on;
+	if (on)
+		write_sysfs(hub[H_HR].delay_node, HR_HUB_PERIOD_NS);
+	apply_enable_mask();
+}
+
+/* keep the AP up for the length of a burst (needs group wakelock; best effort) */
+static void hr_wakelock(int on)
+{
+	int fd = open(on ? "/sys/power/wake_lock" : "/sys/power/wake_unlock", O_WRONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		(void)write(fd, "r800_hr", 7);
+		close(fd);
+	}
+}
+
+static int64_t hr_period(void)
+{
+	return hr_req_ns > HR_MAX_PERIOD_NS ? HR_MAX_PERIOD_NS : hr_req_ns;
+}
+
+/* caller holds lock: start a burst, or skip this one while off the wrist */
+static void hr_burst_begin(int64_t now)
+{
+	if (offbody_state < 0.5f) {
+		hr_skipped++;
+		hr_next = now + hr_period();
+		return;
+	}
+	hr_burst_start = now;
+	hr_bursts++;
+	hr_wakelock(1);
+	hr_hub(1);
+}
+
+/* caller holds lock: stop the running burst; the next starts a period after it */
+static void hr_burst_end(void)
+{
+	hr_hub(0);
+	hr_wakelock(0);
+	hr_next = hr_burst_start + hr_period();
+	hr_burst_start = 0;
+}
+
+/* caller holds lock: apply hr_active / hr_req_ns */
+static void hr_update(int64_t now)
+{
+	int bg = hr_active && hr_req_ns >= HR_BG_MIN_NS;
+	if (!bg && hr_burst_start) {
+		hr_wakelock(0);
+		hr_burst_start = 0;
+	}
+	if (!hr_active) {
+		hr_bg = 0;
+		hr_hub(0);
+	} else if (!bg) {
+		hr_bg = 0;
+		hr_hub(1);
+	} else if (!hr_bg) {
+		/* into burst mode: a burst right away when newly enabled, a period
+		   later when a continuous client (which just measured) has left */
+		int was_on = hub[H_HR].enabled;
+		hr_bg = 1;
+		hr_hub(0);
+		if (was_on)
+			hr_next = now + hr_period();
+		else
+			hr_burst_begin(now);
+	}
+	LOGI("hr: %s, period %lld s", !hr_active ? "off" : hr_bg ? "bursts" : "continuous",
+	     (long long)(hr_req_ns / 1000000000));
+}
+
+/* caller holds lock: burst timers, called after every poll() wake-up */
+static void hr_tick(int64_t now)
+{
+	if (!hr_bg)
+		return;
+	if (hr_burst_start && now >= hr_burst_start + HR_BURST_NS) {
+		LOGI("hr burst %d: no reading in %lld s", hr_bursts,
+		     (long long)(HR_BURST_NS / 1000000000));
+		hr_burst_end();
+	} else if (!hr_burst_start && now >= hr_next) {
+		hr_burst_begin(now);
+	}
+}
+
+/* caller holds lock: poll() timeout for the burst timers, -1 for none */
+static int hr_timeout_ms(int64_t now)
+{
+	if (!hr_bg)
+		return -1;
+	int64_t t = (hr_burst_start ? hr_burst_start + HR_BURST_NS : hr_next) - now;
+	return t <= 0 ? 0 : (int)(t / 1000000) + 1;
+}
+
+static int dev_activate(struct sensors_poll_device_t *dev, int handle, int enabled)
+{
+	(void)dev;
+	if (!valid(handle))
+		return -EINVAL;
+	if (handle >= H_COUNT) {
+		pthread_mutex_lock(&lock);
+		ctx_enabled[handle] = !!enabled;
+		/* on-change: deliver the current state right after activation */
+		if (handle == H_OFFBODY && enabled)
+			offbody_report = 1;
+		/* on-change: the current total right away (0 before any step) */
+		if ((handle == H_STEP_COUNTER || handle == H_STEP_COUNTER_WAKE) && enabled)
+			step_report[handle] = 1;
+		if (handle == H_STEP_DETECTOR)
+			step_detect_pending = 0;
+		pthread_mutex_unlock(&lock);
+		wake_poll();
+		LOGI("activate %d = %d (context)", handle, enabled);
+		return 0;
+	}
+	if (handle == H_HR) {
+		pthread_mutex_lock(&lock);
+		hr_active = !!enabled;
+		hr_update(now_ns());
+		pthread_mutex_unlock(&lock);
+		wake_poll();
+		LOGI("activate %d = %d", handle, enabled);
+		return 0;
+	}
+	pthread_mutex_lock(&lock);
+	hub[handle].enabled = !!enabled;
+	if (enabled && hub[handle].period_ns)
+		write_sysfs(hub[handle].delay_node, hub[handle].period_ns);
+	int r = apply_enable_mask();
+	pthread_mutex_unlock(&lock);
+	LOGI("activate %d = %d (%d)", handle, enabled, r);
+	return r;
+}
+
+static int dev_set_delay(struct sensors_poll_device_t *dev, int handle, int64_t ns)
+{
+	(void)dev;
+	if (!valid(handle))
+		return -EINVAL;
+	if (handle >= H_COUNT)
+		return 0; /* event driven */
+	const struct sensor_t *s = &sensor_list[handle - 1];
+	int64_t req = ns;
+	if (s->minDelay > 0 && ns < (int64_t)s->minDelay * 1000)
+		ns = (int64_t)s->minDelay * 1000;
+	if (ns > (int64_t)s->maxDelay * 1000)
+		ns = (int64_t)s->maxDelay * 1000;
+	if (ns <= 0)
+		ns = 200000000; /* on-change sensors: 200 ms */
+	if (handle == H_HR) {
+		/* the hub's HR always runs at 1 s; slower requests mean bursts */
+		pthread_mutex_lock(&lock);
+		int changed = hr_req_ns != req;
+		hr_req_ns = req;
+		hub[handle].period_ns = HR_HUB_PERIOD_NS;
+		int r = hub[handle].enabled ? write_sysfs(hub[handle].delay_node, hub[handle].period_ns) : 0;
+		if (hr_active && changed)
+			hr_update(now_ns());
+		pthread_mutex_unlock(&lock);
+		wake_poll();
+		return r;
+	}
+	pthread_mutex_lock(&lock);
+	hub[handle].period_ns = ns;
+	int r = hub[handle].enabled ? write_sysfs(hub[handle].delay_node, ns) : 0;
+	pthread_mutex_unlock(&lock);
+	return r;
+}
+
+static int dev_batch(struct sensors_poll_device_1 *dev, int handle, int flags,
+		     int64_t period_ns, int64_t latency_ns)
+{
+	(void)flags;
+	(void)latency_ns; /* no FIFO batching: report immediately */
+	return dev_set_delay(&dev->v0, handle, period_ns);
+}
+
+static int dev_flush(struct sensors_poll_device_1 *dev, int handle)
+{
+	(void)dev;
+	if (!valid(handle))
+		return -EINVAL;
+	pthread_mutex_lock(&lock);
+	int enabled = is_enabled(handle);
+	if (enabled)
+		flush_pending[handle]++;
+	pthread_mutex_unlock(&lock);
+	if (!enabled)
+		return -EINVAL;
+	wake_poll();
+	return 0;
+}
+
+static int dev_inject(struct sensors_poll_device_1 *dev, const sensors_event_t *data)
+{
+	(void)dev;
+	(void)data;
+	return -EINVAL;
+}
+
+/* turn a completed frame into an Android event; returns 1 if *ev was filled */
+static int make_event(struct hub_sensor *s, sensors_event_t *ev)
+{
+	memset(ev, 0, sizeof(*ev));
+	ev->version = sizeof(*ev);
+	ev->sensor = s->handle;
+	ev->type = sensor_list[s->handle - 1].type;
+	ev->timestamp = (int64_t)(((uint64_t)s->ts[0] << 48) | ((uint64_t)s->ts[1] << 32) |
+				  ((uint64_t)s->ts[2] << 16) | (uint64_t)s->ts[3]);
+	if (!ev->timestamp) {
+		struct timespec t;
+		clock_gettime(CLOCK_BOOTTIME, &t);
+		ev->timestamp = (int64_t)t.tv_sec * 1000000000LL + t.tv_nsec;
+	}
+	switch (s->handle) {
+	case H_ACCEL: {
+		const float k = 0.000244f * GRAVITY_EARTH;
+		ev->acceleration.x = s->v[0] * k;
+		ev->acceleration.y = s->v[1] * k;
+		ev->acceleration.z = s->v[2] * k;
+		ev->acceleration.status = SENSOR_STATUS_ACCURACY_HIGH;
+		break;
+	}
+	case H_GYRO: {
+		const float k = 0.070f * (float)M_PI / 180.0f;
+		ev->gyro.x = s->v[0] * k;
+		ev->gyro.y = s->v[1] * k;
+		ev->gyro.z = s->v[2] * k;
+		ev->gyro.status = SENSOR_STATUS_ACCURACY_HIGH;
+		break;
+	}
+	case H_PRESSURE:
+		if (s->v[0] <= 0)
+			return 0;
+		ev->pressure = s->v[0] / 4096.0f;
+		break;
+	case H_LIGHT:
+		ev->light = s->v[0] > 0 ? (float)(s->v[0] - 1) : 0.0f;
+		break;
+	case H_HR: {
+		int bpm = s->v[0] > 0 ? s->v[0] - 1 : 0;
+		ev->heart_rate.bpm = (float)bpm;
+		ev->heart_rate.status = bpm > 0 ? SENSOR_STATUS_ACCURACY_HIGH : SENSOR_STATUS_NO_CONTACT;
+		break;
+	}
+	case H_GYRO_UNCAL: {
+		/* raw rates in RX/RY/RZ, the hub's bias estimate in HWHEEL/DIAL/WHEEL */
+		const float k = 0.070f * (float)M_PI / 180.0f;
+		for (int i = 0; i < 3; i++) {
+			ev->uncalibrated_gyro.uncalib[i] = s->v[i] * k;
+			ev->uncalibrated_gyro.bias[i] = s->v[3 + i] * k;
+		}
+		break;
+	}
+	default:
+		return 0;
+	}
+	return 1;
+}
+
+/* map a REL code to the value slot it fills for this sensor, or -1 */
+static int value_slot(const struct hub_sensor *s, int code)
+{
+	switch (s->handle) {
+	case H_ACCEL:
+	case H_HR:
+		return code >= REL_X && code <= REL_Z ? code - REL_X : -1;
+	case H_GYRO:
+		return code >= REL_RX && code <= REL_RZ ? code - REL_RX : -1;
+	case H_PRESSURE:
+		return code == REL_HWHEEL ? 0 : code == REL_WHEEL ? 1 : code == REL_DIAL ? 2 : -1;
+	case H_LIGHT:
+		return code == REL_RX ? 0 : -1;
+	case H_GYRO_UNCAL:
+		if (code >= REL_RX && code <= REL_RZ)
+			return code - REL_RX;
+		return code == REL_HWHEEL ? 3 : code == REL_DIAL ? 4 : code == REL_WHEEL ? 5 : -1;
+	}
+	return -1;
+}
+
+static int64_t now_ns(void)
+{
+	struct timespec t;
+	clock_gettime(CLOCK_BOOTTIME, &t);
+	return (int64_t)t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+
+/* open the context FIFO (created by android-helper.sh); also hold a write end so
+ * poll() never sees POLLHUP while the helper's writers restart */
+static void ctx_open(void)
+{
+	if (ctx_fd >= 0)
+		return;
+	ctx_fd = open(CTX_FIFO, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+	if (ctx_fd < 0)
+		return;
+	ctx_wfd = open(CTX_FIFO, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+	ctx_len = 0;
+	LOGI("context fifo open (%d/%d)", ctx_fd, ctx_wfd);
+}
+
+static void ctx_event(sensors_event_t *ev, int handle, float value)
+{
+	memset(ev, 0, sizeof(*ev));
+	ev->version = sizeof(*ev);
+	ev->sensor = handle;
+	ev->type = sensor_list[handle - 1].type;
+	ev->timestamp = now_ns();
+	ev->data[0] = value;
+}
+
+/* (lock held) */
+static void step_event(sensors_event_t *ev, int handle)
+{
+	ctx_event(ev, handle, 0.0f);
+	ev->u64.step_counter = step_total;
+}
+
+/* (lock held) queued step counter / detector events */
+static void step_drain(sensors_event_t *data, int count, int *n_out)
+{
+	for (int h = H_STEP_COUNTER; h <= H_STEP_COUNTER_WAKE; h++) {
+		if (!ctx_enabled[h])
+			step_report[h] = 0;
+		else if (step_report[h] && *n_out < count) {
+			step_event(&data[(*n_out)++], h);
+			step_report[h] = 0;
+		}
+	}
+	while (step_detect_pending > 0 && *n_out < count) {
+		if (ctx_enabled[H_STEP_DETECTOR])
+			ctx_event(&data[(*n_out)++], H_STEP_DETECTOR, 1.0f);
+		step_detect_pending--;
+	}
+}
+
+/* parse complete lines from the context FIFO into events */
+static void ctx_read(sensors_event_t *data, int count, int *n_out)
+{
+	ssize_t r;
+	while ((r = read(ctx_fd, ctx_buf + ctx_len, sizeof(ctx_buf) - 1 - ctx_len)) > 0) {
+		ctx_len += r;
+		ctx_buf[ctx_len] = 0;
+		char *line = ctx_buf, *nl;
+		while ((nl = strchr(line, '\n'))) {
+			*nl = 0;
+			pthread_mutex_lock(&lock);
+			if (line[0] == 'W') {
+				if (ctx_enabled[H_WRIST_TILT] && *n_out < count)
+					ctx_event(&data[(*n_out)++], H_WRIST_TILT, 1.0f);
+			} else if (line[0] == 'D') {
+				if (ctx_enabled[H_UNGAZE] && *n_out < count)
+					ctx_event(&data[(*n_out)++], H_UNGAZE, 1.0f);
+			} else if (line[0] == 'O') {
+				/* Samsung wear_on: 1 = worn, 2 = taken off */
+				float st = atoi(line + 1) == 1 ? 1.0f : 0.0f;
+				if (st != offbody_state || offbody_report) {
+					offbody_state = st;
+					offbody_report = 0;
+					if (ctx_enabled[H_OFFBODY] && *n_out < count)
+						ctx_event(&data[(*n_out)++], H_OFFBODY, st);
+				}
+			} else if (line[0] == 'P') {
+				long long raw = atoll(line + 1);
+				if (raw >= 0) {
+					int first = step_raw < 0;
+					long long d = first ? 0 :
+						      raw >= step_raw ? raw - step_raw : raw;
+					if (!first && raw < step_raw)
+						step_base += step_raw;
+					step_raw = raw;
+					step_total = step_base + raw;
+					if (d > 0 || first)
+						for (int h = H_STEP_COUNTER; h <= H_STEP_COUNTER_WAKE; h++)
+							step_report[h] = ctx_enabled[h];
+					/* the hub reports totals, not single steps: one detector
+					   event per new step, capped so a burst can't flood */
+					if (ctx_enabled[H_STEP_DETECTOR])
+						step_detect_pending += d > 64 ? 64 : (int)d;
+					step_drain(data, count, n_out);
+				}
+			}
+			pthread_mutex_unlock(&lock);
+			line = nl + 1;
+		}
+		ctx_len -= line - ctx_buf;
+		memmove(ctx_buf, line, ctx_len);
+		if (ctx_len >= (int)sizeof(ctx_buf) - 1)
+			ctx_len = 0; /* garbage without newline */
+	}
+}
+
+static int dev_poll(struct sensors_poll_device_t *dev, sensors_event_t *data, int count)
+{
+	(void)dev;
+	struct pollfd pfd[H_COUNT + 2];
+	int idx[H_COUNT + 2];
+	int n_out = 0;
+
+	for (;;) {
+		/* flush-complete events first */
+		pthread_mutex_lock(&lock);
+		if (offbody_report && ctx_enabled[H_OFFBODY] && n_out < count) {
+			ctx_event(&data[n_out++], H_OFFBODY, offbody_state);
+			offbody_report = 0;
+		}
+		step_drain(data, count, &n_out);
+		for (int h = H_ACCEL; h < N_HANDLES && n_out < count; h++) {
+			while (flush_pending[h] > 0 && n_out < count) {
+				sensors_event_t *ev = &data[n_out++];
+				memset(ev, 0, sizeof(*ev));
+				ev->version = META_DATA_VERSION;
+				ev->type = SENSOR_TYPE_META_DATA;
+				ev->meta_data.what = META_DATA_FLUSH_COMPLETE;
+				ev->meta_data.sensor = h;
+				flush_pending[h]--;
+			}
+		}
+		pthread_mutex_unlock(&lock);
+		if (n_out)
+			return n_out;
+
+		int n = 0;
+		pfd[n].fd = wake_pipe[0];
+		pfd[n].events = POLLIN;
+		idx[n++] = 0;
+		for (int h = H_ACCEL; h < H_COUNT; h++) {
+			if (hub[h].fd < 0)
+				continue;
+			pfd[n].fd = hub[h].fd;
+			pfd[n].events = POLLIN;
+			idx[n++] = h;
+		}
+		ctx_open();
+		if (ctx_fd >= 0) {
+			pfd[n].fd = ctx_fd;
+			pfd[n].events = POLLIN;
+			idx[n++] = H_WRIST_TILT; /* marker: context fifo */
+		}
+		/* until the helper has made the FIFO, look for it every 5 s */
+		int tmo = ctx_fd >= 0 ? -1 : 5000;
+		pthread_mutex_lock(&lock);
+		int ht = hr_timeout_ms(now_ns());
+		pthread_mutex_unlock(&lock);
+		if (ht >= 0 && (tmo < 0 || ht < tmo))
+			tmo = ht;
+		int pr = poll(pfd, n, tmo);
+		pthread_mutex_lock(&lock);
+		hr_tick(now_ns());
+		pthread_mutex_unlock(&lock);
+		if (pr < 0) {
+			if (errno == EINTR)
+				continue;
+			return -errno;
+		}
+		if (pfd[0].revents & POLLIN) {
+			char buf[16];
+			(void)read(wake_pipe[0], buf, sizeof(buf));
+		}
+		for (int i = 1; i < n && n_out < count; i++) {
+			if (!(pfd[i].revents & POLLIN))
+				continue;
+			if (idx[i] == H_WRIST_TILT) {
+				ctx_read(data, count, &n_out);
+				continue;
+			}
+			struct hub_sensor *s = &hub[idx[i]];
+			struct input_event ie[32];
+			ssize_t r;
+			while (n_out < count && (r = read(s->fd, ie, sizeof(ie))) > 0) {
+				int k = r / sizeof(ie[0]);
+				for (int j = 0; j < k && n_out < count; j++) {
+					if (ie[j].type == EV_REL) {
+						int c = ie[j].code;
+						if (c >= s->ts_code && c < s->ts_code + 4)
+							s->ts[c - s->ts_code] = (uint16_t)ie[j].value;
+						else {
+							int slot = value_slot(s, c);
+							if (slot >= 0)
+								s->v[slot] = ie[j].value;
+						}
+					} else if (ie[j].type == EV_SYN && ie[j].code == SYN_REPORT) {
+						int on;
+						pthread_mutex_lock(&lock);
+						on = s->enabled;
+						/* burst mode: only the first settled reading (v = bpm + 1),
+						   which also ends the burst */
+						if (s->handle == H_HR && hr_bg) {
+							int64_t t = now_ns();
+							on = hr_burst_start && s->v[0] > 1 &&
+							     t - hr_burst_start >= HR_SETTLE_NS;
+							if (on) {
+								LOGI("hr burst %d: %d bpm after %lld s (%d skipped off-wrist)",
+								     hr_bursts, s->v[0] - 1,
+								     (long long)((t - hr_burst_start) / 1000000000),
+								     hr_skipped);
+								hr_burst_end();
+							}
+						}
+						pthread_mutex_unlock(&lock);
+						if (on && make_event(s, &data[n_out]))
+							n_out++;
+						memset(s->v, 0, sizeof(s->v));
+						memset(s->ts, 0, sizeof(s->ts));
+					}
+				}
+			}
+		}
+		if (n_out)
+			return n_out;
+	}
+}
+
+static int dev_close(struct hw_device_t *dev)
+{
+	free(dev);
+	return 0;
+}
+
+static int open_sensors(const struct hw_module_t *module, const char *id, struct hw_device_t **device)
+{
+	if (strcmp(id, SENSORS_HARDWARE_POLL))
+		return -EINVAL;
+	sensors_poll_device_1_t *dev = calloc(1, sizeof(*dev));
+	if (!dev)
+		return -ENOMEM;
+	pthread_mutex_lock(&lock);
+	if (wake_pipe[0] < 0) {
+		if (pipe2(wake_pipe, O_NONBLOCK | O_CLOEXEC) < 0) {
+			pthread_mutex_unlock(&lock);
+			free(dev);
+			return -errno;
+		}
+		open_inputs();
+		for (int h = H_ACCEL; h < H_COUNT; h++)
+			hub[h].enabled = 0;
+		apply_enable_mask();
+	}
+	pthread_mutex_unlock(&lock);
+
+	dev->common.tag = HARDWARE_DEVICE_TAG;
+	dev->common.version = SENSORS_DEVICE_API_VERSION_1_3;
+	dev->common.module = (struct hw_module_t *)module;
+	dev->common.close = dev_close;
+	dev->activate = dev_activate;
+	dev->setDelay = dev_set_delay;
+	dev->poll = dev_poll;
+	dev->batch = dev_batch;
+	dev->flush = dev_flush;
+	dev->inject_sensor_data = dev_inject;
+	*device = &dev->common;
+	LOGI("opened, %d sensors", N_SENSORS);
+	return 0;
+}
+
+static int get_sensors_list(struct sensors_module_t *module, struct sensor_t const **list)
+{
+	(void)module;
+	*list = sensor_list;
+	return N_SENSORS;
+}
+
+static int set_operation_mode(unsigned int mode)
+{
+	return mode == 0 ? 0 : -EINVAL;
+}
+
+static struct hw_module_methods_t sensors_methods = {
+	.open = open_sensors,
+};
+
+__attribute__((visibility("default")))
+struct sensors_module_t HAL_MODULE_INFO_SYM = {
+	.common = {
+		.tag = HARDWARE_MODULE_TAG,
+		.module_api_version = SENSORS_MODULE_API_VERSION_0_1,
+		.hal_api_version = HARDWARE_HAL_API_VERSION,
+		.id = SENSORS_HARDWARE_MODULE_ID,
+		.name = "SM-R800 SSP sensor hub",
+		.author = "r800-wearos",
+		.methods = &sensors_methods,
+	},
+	.get_sensors_list = get_sensors_list,
+	.set_operation_mode = set_operation_mode,
+};

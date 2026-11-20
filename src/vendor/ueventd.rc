@@ -1,0 +1,6 @@
+# SM-R800 vendor ueventd (minimal)
+/dev/graphics/fb*         0660   system     graphics
+/dev/fb*                  0660   system     graphics
+/dev/mali0                0666   system     graphics
+/dev/ion                  0664   system     system
+/dev/input/*              0660   root       input

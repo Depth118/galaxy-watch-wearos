@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SM-R800 framework overrides. (The overlay is named "pinner" after its first entry.) -->
+<resources>
+    <!-- 768 MB: don't mlock ~66 MB of framework files. Keep the home app pinned. -->
+    <string-array name="config_defaultPinnerServiceFiles" translatable="false"/>
+    <!-- No ambient burn-in mask. WindowManager draws a pixel mask over the
+         ambient face whenever the light sensor reads below this many lux (stock
+         1000, i.e. always indoors); its pattern gets sparser in the dark. On
+         this panel it looks like dots and fading. -1 disables the mask. -->
+    <integer name="config_burnInProtectionMaskThreshold">-1</integer>
+</resources>

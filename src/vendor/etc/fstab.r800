@@ -1,0 +1,6 @@
+# /data: ext4 on loop2 = userdata.img on p17 (persistent) or zram (RAM-backed like tmpfs, but supports user.* xattrs, which
+# UserManager needs for user.serial; on tmpfs it deleted /data/system_de/0 and
+# crashed system_server). start.sh fills /dev/zram0 with a blank ext4 before handover.
+# <src>            <mnt_point>  <type>  <mnt_flags and options>                      <fs_mgr_flags>
+/dev/block/loop2   /data        ext4    nosuid,nodev,noatime                          wait
+tmpfs              /cache       tmpfs   nosuid,nodev,noatime,size=32m,mode=0770,uid=1000,gid=2001    defaults

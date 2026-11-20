@@ -1,0 +1,1320 @@
+/*
+ * hwcomposer.r800.so - minimal HWC 1.1 module for the Galaxy Watch SM-R800 (Exynos 9110)
+ * bring-up on Wear OS 2 (Android 9).
+ *
+ * SurfaceFlinger composes everything on the GPU (Mali-T720) into the framebuffer
+ * target. set() waits for that buffer, maps it through the gralloc module
+ * (gralloc.exynos5 from the Galaxy J4), copies it into the back half of
+ * /dev/graphics/fb0 and flips with FBIOPAN_DISPLAY. Vsync comes from the
+ * panel's TE through DECON, with timer fill-ins on the same grid while idle.
+ *
+ * Loaded by android.hardware.graphics.composer@2.1-impl via hw_get_module("hwcomposer")
+ * (ro.hardware = r800) and wrapped by its HWC2On1Adapter.
+ */
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/fb.h>
+#include <poll.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/system_properties.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <linux/sync_file.h>
+#include <arm_neon.h>
+#include <android/log.h>
+#include <hardware/hardware.h>
+#include <hardware/gralloc.h>
+#include <hardware/hwcomposer.h>
+
+#define TAG "hwc-r800"
+#include <stdarg.h>
+#include <stdio.h>
+/* Log to logcat AND the kernel log (bring-up: kmsg survives into Tizen's last_kmsg). */
+static void hlog(int prio, const char *fmt, ...)
+{
+	static int kfd = -2;
+	char buf[480];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	__android_log_write(prio, TAG, buf);
+	if (kfd == -2)
+		kfd = open("/dev/kmsg", O_WRONLY | O_CLOEXEC);
+	if (kfd >= 0)
+		dprintf(kfd, "<3>hwc-r800: %s\n", buf);
+	{
+		static int ffd = -2;
+		if (ffd == -2)
+			ffd = open("/oem/r800dev/hwc.log",
+				   O_WRONLY | O_CREAT | O_APPEND, 0644);
+		if (ffd >= 0)
+			dprintf(ffd, "%s\n", buf);
+	}
+}
+#define LOGI(...) hlog(ANDROID_LOG_ERROR, __VA_ARGS__)  /* bring-up: surface in '*:W' capture */
+#define LOGW(...) hlog(ANDROID_LOG_WARN, __VA_ARGS__)
+#define LOGE(...) hlog(ANDROID_LOG_ERROR, __VA_ARGS__)
+
+#define VSYNC_PERIOD_NS 16666667LL
+
+/*
+ * Zero-copy present: hand the client-target dma-buf straight to the Exynos
+ * DECON with S3CFB_WIN_CONFIG (what Samsung's own HWC does). Mirrors
+ * drivers/video/fbdev/exynos/dpu30/decon.h of our kernel; the ioctl number
+ * encodes sizeof(struct r800_win_config_data), so a layout mismatch fails
+ * with ENOTTY and we fall back to the CPU copy.
+ */
+#define R800_MAX_DECON_WIN	3
+#define R800_WIN_STATE_DISABLED	0
+#define R800_WIN_STATE_BUFFER	2
+#define R800_FMT_RGBA_8888	2
+#define R800_BLENDING_NONE	0
+
+struct r800_win_rect { int x, y; uint32_t w, h; };
+struct r800_frame { int x, y; uint32_t w, h, f_w, f_h; };
+struct r800_dpp_params {
+	uint64_t addr[3];
+	int rot, eq_mode, comp_src, hdr_std;
+	uint32_t min_luminance, max_luminance;
+};
+struct r800_win_config {
+	int state;
+	union {
+		uint32_t color;
+		struct {
+			int fd_idma[3];
+			int acq_fence;
+			int rel_fence;
+			int plane_alpha;
+			int blending;
+			uint32_t channel;
+			int format;
+			struct r800_dpp_params dpp_parm;
+			struct r800_win_rect block_area;
+			struct r800_win_rect transparent_area;
+			struct r800_win_rect opaque_area;
+			struct r800_frame src;
+		};
+	};
+	struct r800_frame dst;
+	_Bool protection;
+	_Bool compression;
+};
+struct r800_win_config_data {
+	int retire_fence;
+	int fd_odma;
+	struct r800_win_config config[R800_MAX_DECON_WIN + 1];
+};
+#define R800_S3CFB_WIN_CONFIG _IOW('F', 209, struct r800_win_config_data)
+
+struct r800_hwc {
+	hwc_composer_device_1_t base;      /* must be first */
+	const hwc_procs_t *procs;
+	const gralloc_module_t *gralloc;
+
+	int fb_fd;
+	struct fb_var_screeninfo var;
+	struct fb_fix_screeninfo fix;
+	uint8_t *fb_mem;
+	unsigned int front;                /* 0 or 1: which half is on screen */
+
+	pthread_t vsync_thread;
+	pthread_mutex_t lock;
+	pthread_cond_t cond;
+	int vsync_enabled;
+	int blanked;
+	int power_mode;                    /* HWC_POWER_MODE_*: last mode set */
+	int logged_handle;
+	unsigned long frames;
+	uint64_t no_buffer;                /* layers prepare() saw as BACKGROUND/SIDEBAND */
+	int swap_rb;                       /* RGBA buffers -> BGRA panel: swap R and B */
+	int zerocopy;                      /* 1: S3CFB_WIN_CONFIG, 0: CPU copy + pan */
+	unsigned long wc_fail;
+	int fencescan_seen;                /* debug.r800.fencescan: change it to log our open fences */
+	int dump_left, dump_seen;
+	/* ambient: DECON is put in DOZE_SUSPEND after doze_idle_ms without a frame */
+	pthread_t idle_thread;
+	pthread_mutex_t doze_lock;
+	pthread_cond_t doze_cond;
+	int doze_susp;                     /* we put DECON in DOZE_SUSPEND */
+	int64_t last_present_ns;
+	unsigned long doze_suspends;
+
+	/* overlays: up to R800_MAX_DECON_WIN layers straight to DECON windows */
+	int fmt_verified;                  /* 1: handle format field checked on the FB target; -1: layout unknown */
+	int ovl_off;                       /* overlays disabled after repeated WIN_CONFIG failures */
+	int ovl_n;                         /* this frame: layers marked HWC_OVERLAY by prepare() */
+	size_t ovl_idx[R800_MAX_DECON_WIN];
+	unsigned long ovl_frames, gpu_frames, ovl_fail;
+};
+
+static void fb_fill(struct r800_hwc *h, uint32_t col);
+static int handle_geom(buffer_handle_t hnd, int w, int ht, int *stride, int *fmt);
+
+/* ---- gralloc (looked up at run time: the NDK has no libhardware stub) ---- */
+static const gralloc_module_t *load_gralloc(void)
+{
+	typedef int (*hw_get_module_t)(const char *, const struct hw_module_t **);
+	void *lib = dlopen("libhardware.so", RTLD_NOW);
+	if (!lib) {
+		LOGE("dlopen libhardware.so: %s", dlerror());
+		return NULL;
+	}
+	hw_get_module_t get = (hw_get_module_t)dlsym(lib, "hw_get_module");
+	const struct hw_module_t *mod = NULL;
+	if (!get || get(GRALLOC_HARDWARE_MODULE_ID, &mod) || !mod) {
+		LOGE("hw_get_module(gralloc) failed");
+		return NULL;
+	}
+	LOGI("gralloc module '%s' by '%s'", mod->name, mod->author);
+	return (const gralloc_module_t *)mod;
+}
+
+/*
+ * Row stride (pixels) of a gralloc buffer. Exynos private handles carry
+ * "... width, height, stride, vstride ..." as consecutive ints; find
+ * width,height and take the next int if it looks like a stride.
+ */
+static int handle_stride(struct r800_hwc *h, buffer_handle_t hnd, int w, int ht, int *matched)
+{
+	const native_handle_t *nh = (const native_handle_t *)hnd;
+	const int *ints = &nh->data[nh->numFds];
+	int i, stride = w;
+
+	*matched = 0;
+	for (i = 0; i + 2 < nh->numInts; i++) {
+		if (ints[i] == w && ints[i + 1] == ht && ints[i + 2] >= w && ints[i + 2] <= w + 128) {
+			stride = ints[i + 2];
+			*matched = 1;
+			break;
+		}
+	}
+	if (!h->logged_handle) {
+		char buf[512];
+		int n = 0, k;
+		for (k = 0; k < nh->numInts && k < 40 && n < (int)sizeof(buf) - 16; k++)
+			n += snprintf(buf + n, sizeof(buf) - n, "%d ", ints[k]);
+		LOGI("client target handle: numFds=%d numInts=%d ints=[%s] -> stride %d (match at %d)",
+		     nh->numFds, nh->numInts, buf, stride, i + 2 < nh->numInts ? i + 2 : -1);
+		h->logged_handle = 1;
+	}
+	return stride;
+}
+
+/*
+ * Is this a readable native_handle_t? hwc_layer_1.handle shares a union with
+ * backgroundColor, so a solid-color layer hands us a color as a "pointer"
+ * (run 102: SIGBUS BUS_ADRALN at 0x7 = handle 0x3 + offsetof(numFds)).
+ * msync() fails with ENOMEM on unmapped pages, so it probes without faulting.
+ */
+static int handle_ok(buffer_handle_t hnd)
+{
+	const native_handle_t *nh = (const native_handle_t *)hnd;
+	uintptr_t p = (uintptr_t)hnd;
+	const uintptr_t pg = 4096;
+
+	if (p < pg || (p & 3))
+		return 0;
+	if (msync((void *)(p & ~(pg - 1)), pg, MS_ASYNC))
+		return 0;
+	if ((p & (pg - 1)) > pg - sizeof(native_handle_t) &&
+	    msync((void *)((p & ~(pg - 1)) + pg), pg, MS_ASYNC))
+		return 0;
+	if (nh->version != (int)sizeof(native_handle_t) || nh->numFds < 0 || nh->numFds > 8 ||
+	    nh->numInts < 0 || nh->numInts > 128)
+		return 0;
+	return 1;
+}
+
+/* Size of the buffer behind a gralloc handle (its first fd is a dma-buf), 0 if unknown. */
+static size_t handle_size(buffer_handle_t hnd)
+{
+	const native_handle_t *nh = (const native_handle_t *)hnd;
+	off_t sz;
+
+	if (nh->numFds < 1 || nh->data[0] < 0)
+		return 0;
+	sz = lseek(nh->data[0], 0, SEEK_END);
+	return sz > 0 ? (size_t)sz : 0;
+}
+
+/* debug.r800.fencescan: histogram of this process's open sync_file fds by
+ * timeline (the hang 3 leak hunt; one composer fd leaked per frame). */
+static void fence_scan(void)
+{
+	struct { char key[72]; int count, lo, hi, signaled; } k[16];
+	int nk = 0, fd, total = 0;
+	memset(k, 0, sizeof(k));
+	for (fd = 0; fd < 32768; fd++) {
+		struct sync_fence_info fi[2];
+		struct sync_file_info info;
+		char key[72];
+		int j;
+		memset(&info, 0, sizeof(info));
+		memset(fi, 0, sizeof(fi));
+		info.num_fences = 2;
+		info.sync_fence_info = (uintptr_t)fi;
+		if (ioctl(fd, SYNC_IOC_FILE_INFO, &info))
+			continue;
+		total++;
+		{
+			char *dash = strrchr(info.name, '-');
+			if (dash && dash != info.name)
+				*dash = 0;     /* drop the seqno: group by timeline */
+		}
+		snprintf(key, sizeof(key), "%.40s %.10s", info.name, fi[0].driver_name);
+		for (j = 0; j < nk && strcmp(k[j].key, key); j++)
+			;
+		if (j == nk) {
+			if (nk == 16)
+				continue;
+			strcpy(k[nk].key, key);
+			k[nk].lo = fd;
+			nk++;
+		}
+		k[j].count++;
+		k[j].hi = fd;
+		k[j].signaled += info.status == 1;
+	}
+	LOGE("fence scan: %d sync_files", total);
+	for (fd = 0; fd < nk; fd++)
+		LOGE("  %5d x '%s' fds %d..%d, %d signaled", k[fd].count, k[fd].key, k[fd].lo, k[fd].hi,
+		     k[fd].signaled);
+}
+
+static void wait_fence(int fd)
+{
+	if (fd < 0)
+		return;
+	struct pollfd p = { .fd = fd, .events = POLLIN };
+	if (poll(&p, 1, 1000) == 0)
+		LOGW("acquire fence %d timed out", fd);
+	close(fd);
+}
+
+/* ---- framebuffer ---- */
+static int fb_open(struct r800_hwc *h)
+{
+	h->fb_fd = open("/dev/graphics/fb0", O_RDWR | O_CLOEXEC);
+	if (h->fb_fd < 0)
+		h->fb_fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
+	if (h->fb_fd < 0) {
+		LOGE("open fb0: %s", strerror(errno));
+		return -errno;
+	}
+	if (ioctl(h->fb_fd, FBIOGET_FSCREENINFO, &h->fix) || ioctl(h->fb_fd, FBIOGET_VSCREENINFO, &h->var)) {
+		LOGE("FBIOGET_*SCREENINFO: %s", strerror(errno));
+		return -errno;
+	}
+	h->fb_mem = mmap(NULL, h->fix.smem_len, PROT_READ | PROT_WRITE, MAP_SHARED, h->fb_fd, 0);
+	if (h->fb_mem == MAP_FAILED) {
+		LOGE("mmap fb0 (%u bytes): %s", h->fix.smem_len, strerror(errno));
+		h->fb_mem = NULL;
+		return -errno;
+	}
+	LOGI("fb0 %ux%u (virt %ux%u) %ubpp line %u smem %u, %ux%u mm",
+	     h->var.xres, h->var.yres, h->var.xres_virtual, h->var.yres_virtual,
+	     h->var.bits_per_pixel, h->fix.line_length, h->fix.smem_len, h->var.width, h->var.height);
+	/* Run 105: blue UI showed orange, so the panel takes BGRA while gralloc
+	 * buffers are RGBA. Swap in the copy (FBIOPUT_VSCREENINFO could mode-set the
+	 * panel, whose re-init is broken). debug.r800.swaprb=0 turns it off. */
+	{
+		char v[PROP_VALUE_MAX] = "";
+		__system_property_get("debug.r800.swaprb", v);
+		h->swap_rb = (v[0] == '0') ? 0 : 1;
+		v[0] = 0;
+		__system_property_get("debug.r800.zerocopy", v);
+		h->zerocopy = (v[0] == '0') ? 0 : 1;
+		LOGI("fb0 rgba offsets r%u g%u b%u a%u, swap_rb=%d zerocopy=%d (win_config_data %zu bytes)",
+		     h->var.red.offset, h->var.green.offset, h->var.blue.offset, h->var.transp.offset,
+		     h->swap_rb, h->zerocopy, sizeof(struct r800_win_config_data));
+	}
+	return 0;
+}
+
+static void fb_fill(struct r800_hwc *h, uint32_t col)
+{
+	uint32_t *px = (uint32_t *)h->fb_mem;
+	size_t n32 = h->fix.smem_len / 4, i;
+	if (!h->fb_mem)
+		return;
+	for (i = 0; i < n32; i++)
+		px[i] = col;
+	h->var.yoffset = 0;
+	ioctl(h->fb_fd, FBIOPAN_DISPLAY, &h->var);
+}
+
+static void fb_present(struct r800_hwc *h, buffer_handle_t buf, int is_target)
+{
+	const unsigned int w = h->var.xres, ht = h->var.yres, bpp = h->var.bits_per_pixel / 8;
+	const unsigned int halves = (h->var.yres_virtual >= 2 * ht &&
+				     h->fix.smem_len >= 2 * ht * h->fix.line_length) ? 2 : 1;
+	const unsigned int back = halves == 2 ? !h->front : 0;
+	void *src = NULL;
+	unsigned int y;
+	int stride, err, matched;
+
+	if (!h->fb_mem)
+		return;
+	/* On any failure keep the previous frame on screen (the old debug colour
+	 * fills showed up as a white screen whenever gralloc ran out of memory). */
+	if (!h->gralloc || !buf)
+		return;
+	if (!handle_ok(buf)) {        /* not a buffer (e.g. a color): keep the last frame */
+		static unsigned long bad;
+		if (bad++ < 5 || (bad % 600) == 0)
+			LOGW("skip %s: bad handle %p (%lu)", is_target ? "target" : "fallback", (void *)buf, bad);
+		return;
+	}
+	stride = handle_stride(h, buf, (int)w, (int)ht, &matched);
+	{
+		/* A full-screen copy out of a smaller buffer reads past its mapping:
+		 * SIGBUS killed the composer and, with it, the panel (run 101).
+		 * Skip such frames; the previous one stays on screen. */
+		static unsigned long skipped;
+		size_t need = (size_t)(ht - 1) * stride * bpp + (size_t)w * bpp;
+		size_t have = handle_size(buf);
+		/* ION fds here report size 0; then trust a handle that itself says
+		 * "w x ht, stride s" (Exynos private handle), else only the FB target. */
+		if ((have && have < need) || (!have && !is_target && !matched)) {
+			if (skipped++ < 5 || (skipped % 600) == 0)
+				LOGW("skip %s buffer: %zu bytes < %zu needed (stride %d), skipped %lu",
+				     is_target ? "target" : "fallback", have, need, stride, skipped);
+			return;
+		}
+	}
+	err = h->gralloc->lock(h->gralloc, buf, GRALLOC_USAGE_SW_READ_OFTEN, 0, 0, w, ht, &src);
+	if (err || !src) {
+		static unsigned long lockfail;
+		if (lockfail++ < 5 || (lockfail % 600) == 0)
+			LOGW("gralloc lock failed (%d), keeping last frame (%lu)", err, lockfail);
+		return;
+	}
+	uint8_t *dst = h->fb_mem + (size_t)back * ht * h->fix.line_length;
+	if (h->swap_rb && bpp == 4) {
+		/* NEON: vld4 de-interleaves 16 pixels per load (whole-line reads, which
+		 * matters on the uncached GPU buffer) and R/B swap is just a register
+		 * swap before vst4. The old per-pixel loop cost ~35% CPU at 60 fps. */
+		for (y = 0; y < ht; y++) {
+			const uint32_t *s = (const uint32_t *)((uint8_t *)src + (size_t)y * stride * bpp);
+			uint32_t *o = (uint32_t *)(dst + (size_t)y * h->fix.line_length);
+			unsigned int x = 0;
+			for (; x + 16 <= w; x += 16) {
+				uint8x16x4_t v = vld4q_u8((const uint8_t *)(s + x));
+				uint8x16_t t = v.val[0];
+				v.val[0] = v.val[2];
+				v.val[2] = t;
+				vst4q_u8((uint8_t *)(o + x), v);
+			}
+			for (; x < w; x++) {
+				uint32_t p = s[x];
+				o[x] = (p & 0xff00ff00u) | ((p & 0xffu) << 16) | ((p >> 16) & 0xffu);
+			}
+		}
+	} else {
+		for (y = 0; y < ht; y++)
+			memcpy(dst + (size_t)y * h->fix.line_length, (uint8_t *)src + (size_t)y * stride * bpp, w * bpp);
+	}
+	h->gralloc->unlock(h->gralloc, buf);
+
+	h->var.yoffset = back * ht;
+	if (ioctl(h->fb_fd, FBIOPAN_DISPLAY, &h->var))
+		LOGW("FBIOPAN_DISPLAY: %s", strerror(errno));
+	h->front = back;
+	if (h->frames++ < 3 || (h->frames % 600) == 0)
+		LOGI("presented frame %lu (half %u)", h->frames, back);
+}
+
+/* Returns 0 when DECON took the buffer; fills the layer's release fence and
+ * *retire. On failure the acquire fence is left untouched for the copy path. */
+static int wc_present(struct r800_hwc *h, hwc_layer_1_t *l, int *retire)
+{
+	const native_handle_t *nh = (const native_handle_t *)l->handle;
+	const unsigned int w = h->var.xres, ht = h->var.yres;
+	struct r800_win_config_data d;
+	struct r800_win_config *c = &d.config[0];
+	int i, stride, matched;
+	if (!l->handle || !handle_ok(l->handle) || nh->numFds < 1 || nh->data[0] < 0) {
+		static unsigned long bad;
+		if (l->handle && bad++ < 5)
+			LOGE("zero-copy: unusable handle %p (fds %d fd0 %d)", (void *)l->handle,
+			     l->handle ? nh->numFds : -1, l->handle && nh->numFds > 0 ? nh->data[0] : -1);
+		return -1;
+	}
+	stride = handle_stride(h, l->handle, (int)w, (int)ht, &matched);
+	if (!h->fmt_verified && l->compositionType == HWC_FRAMEBUFFER_TARGET) {
+		/* the client target is RGBA_8888: proves where the format int sits */
+		int s2, fmt = -1;
+		h->fmt_verified = handle_geom(l->handle, (int)w, (int)ht, &s2, &fmt) == 0 &&
+				  fmt == HAL_PIXEL_FORMAT_RGBA_8888 ? 1 : -1;
+		LOGE("overlay: handle format check on FB target: format int %d -> overlays %s", fmt,
+		     h->fmt_verified == 1 ? "available" : "OFF");
+	}
+
+	memset(&d, 0, sizeof(d));
+	d.retire_fence = -1;
+	d.fd_odma = -1;
+	for (i = 0; i <= R800_MAX_DECON_WIN; i++) {
+		d.config[i].state = R800_WIN_STATE_DISABLED;
+		d.config[i].fd_idma[0] = d.config[i].fd_idma[1] = d.config[i].fd_idma[2] = -1;
+		d.config[i].acq_fence = d.config[i].rel_fence = -1;
+	}
+	c->state = R800_WIN_STATE_BUFFER;
+	c->fd_idma[0] = nh->data[0];
+	c->acq_fence = l->acquireFenceFd;      /* DECON waits for the GPU itself */
+	c->plane_alpha = 0xff;
+	c->blending = R800_BLENDING_NONE;
+	c->channel = 0;                        /* DT default_ch */
+	c->format = R800_FMT_RGBA_8888;        /* no R/B swap needed */
+	c->src = (struct r800_frame){ 0, 0, w, ht, (uint32_t)stride, ht };
+	c->dst = (struct r800_frame){ 0, 0, w, ht, w, ht };
+
+	{
+		static int first = 1;
+		if (first) {
+			first = 0;
+			LOGE("zero-copy: first WIN_CONFIG (fd %d acq %d stride %d) ioctl 0x%x",
+			     c->fd_idma[0], c->acq_fence, stride, (unsigned)R800_S3CFB_WIN_CONFIG);
+		}
+	}
+	if (ioctl(h->fb_fd, R800_S3CFB_WIN_CONFIG, &d)) {
+		int e = errno;
+		if (h->wc_fail++ < 5 || (h->wc_fail % 600) == 0)
+			LOGE("S3CFB_WIN_CONFIG failed: %s (%lu)", strerror(e), h->wc_fail);
+		if (e == ENOTTY || e == EINVAL || h->wc_fail > 20) {
+			LOGE("zero-copy disabled (%s): falling back to CPU copy", strerror(e));
+			h->zerocopy = 0;
+		}
+		return -1;
+	}
+	if (l->acquireFenceFd >= 0)
+		close(l->acquireFenceFd);
+	l->acquireFenceFd = -1;
+	/* HWC2 has no release fence for the client target (the present fence
+	 * releases the previous target buffer), and the retire fence returned
+	 * below signals at the same point, so drop the window's release fence. */
+	if (c->rel_fence >= 0)
+		close(c->rel_fence);
+	l->releaseFenceFd = -1;
+	*retire = d.retire_fence;
+	if (h->frames++ < 3 || (h->frames % 1800) == 0)
+		LOGI("zero-copy frame %lu (stride %d, rel %d, retire %d)", h->frames, stride,
+		     c->rel_fence, d.retire_fence);
+	return 0;
+}
+
+/*
+ * Layer stride. Samsung's libhwc2on1adapter (J4 vendor) is built against an
+ * hwc_layer_1_t of 100 bytes (one extra int after the AOSP 96), so indexing
+ * hwLayers[] with our header read every layer after the first from the wrong
+ * place: the FB target was never found (its acquire fence leaked every frame,
+ * hang 3), prepare() wrote composition types into the adapter's padding, and
+ * "zero-copy" showed layer 0 instead of the composed frame. The last layer is
+ * always the FB target, so pick the stride that puts it there.
+ */
+static size_t g_stride;
+static size_t layer_stride(const hwc_display_contents_1_t *c)
+{
+	static const size_t cand[2] = { 100, sizeof(hwc_layer_1_t) };
+	size_t s = 100;
+	int k;
+	if (c->numHwLayers > 1)
+		for (k = 0; k < 2; k++) {
+			const hwc_layer_1_t *last = (const hwc_layer_1_t *)((const char *)c->hwLayers +
+									  (c->numHwLayers - 1) * cand[k]);
+			if (last->compositionType == HWC_FRAMEBUFFER_TARGET) {
+				s = cand[k];
+				break;
+			}
+		}
+	else
+		s = g_stride ? g_stride : 100;
+	if (s != g_stride) {
+		LOGE("hwc_layer_1 stride %zu (header sizeof %zu, %zu layers)", s, sizeof(hwc_layer_1_t),
+		     c->numHwLayers);
+		g_stride = s;
+	}
+	return s;
+}
+#define LAYER(c, i) ((hwc_layer_1_t *)((char *)(c)->hwLayers + (size_t)(i) * layer_stride(c)))
+
+/*
+ * ---- Overlays (2026-11-18) ----
+ * SurfaceFlinger composed every frame on the GPU (all layers CLIENT): a 37 s
+ * scroll trace had it in drawLayers for 36.9 s, and the single Mali-T720
+ * core it shares with the apps ran at 667 MHz whenever the screen moved.
+ * DECON has 3 windows / 3 DPP channels that blend in hardware, so when every
+ * layer is a plain buffer (no scaling, no transform, RGBA/RGBX/BGRA, on
+ * screen) and there are at most 3 of them, prepare() marks them all
+ * HWC_OVERLAY and set() hands each to its own window, bottom layer first.
+ * Anything else falls back to GPU composition for the whole frame.
+ * vendor.hwc.r800.overlay=0 turns it off.
+ *
+ * Pixel format: the Exynos private handle has "... format, width, height,
+ * stride ..." as consecutive ints (handle_stride() already relies on
+ * width/height/stride). The format guess is checked once on the client
+ * target, which is always RGBA_8888; if it does not read 1 there, overlays
+ * stay off (fmt_verified = -1).
+ */
+static int handle_geom(buffer_handle_t hnd, int w, int ht, int *stride, int *fmt)
+{
+	const native_handle_t *nh = (const native_handle_t *)hnd;
+	const int *ints = &nh->data[nh->numFds];
+	int i;
+
+	for (i = 1; i + 2 < nh->numInts; i++)
+		if (ints[i] == w && ints[i + 1] == ht && ints[i + 2] >= w && ints[i + 2] <= w + 128) {
+			*stride = ints[i + 2];
+			*fmt = ints[i - 1];
+			return 0;
+		}
+	return -1;
+}
+
+static int ovl_enabled(struct r800_hwc *h)
+{
+	char v[PROP_VALUE_MAX] = "";
+	if (h->ovl_off || h->fmt_verified != 1 || !h->zerocopy || h->blanked ||
+	    h->power_mode != HWC_POWER_MODE_NORMAL)
+		return 0;
+	__system_property_get("vendor.hwc.r800.overlay", v);
+	return v[0] != '0';
+}
+
+/* DECON window parameters for a layer, or -1 if it cannot be an overlay. */
+static int ovl_layer(struct r800_hwc *h, hwc_layer_1_t *l, struct r800_win_config *c)
+{
+	const native_handle_t *nh = (const native_handle_t *)l->handle;
+	const hwc_rect_t *df = &l->displayFrame;
+	int sl = (int)l->sourceCropf.left, st = (int)l->sourceCropf.top;
+	int sw = (int)l->sourceCropf.right - sl, sh = (int)l->sourceCropf.bottom - st;
+	int dw = df->right - df->left, dh = df->bottom - df->top;
+	int stride, fmt, dfmt, blend;
+
+	if (l->compositionType != HWC_FRAMEBUFFER && l->compositionType != HWC_OVERLAY)
+		return -1;
+	if ((l->flags & HWC_SKIP_LAYER) || l->transform || !l->handle || !handle_ok(l->handle) ||
+	    nh->numFds < 1 || nh->data[0] < 0)
+		return -1;
+	/* whole buffer, 1:1, fully on screen */
+	if (sl || st || sw != dw || sh != dh || sw < 16 || sh < 1 ||
+	    (float)sw != l->sourceCropf.right || (float)sh != l->sourceCropf.bottom ||
+	    df->left < 0 || df->top < 0 || df->right > (int)h->var.xres || df->bottom > (int)h->var.yres)
+		return -1;
+	if (handle_geom(l->handle, sw, sh, &stride, &fmt))
+		return -1;
+	switch (fmt) {
+	case HAL_PIXEL_FORMAT_RGBA_8888: dfmt = 2; break;   /* DECON_PIXEL_FORMAT_RGBA_8888 */
+	case HAL_PIXEL_FORMAT_RGBX_8888: dfmt = 6; break;   /* RGBX_8888 */
+	case HAL_PIXEL_FORMAT_BGRA_8888: dfmt = 3; break;   /* BGRA_8888 */
+	default: return -1;
+	}
+	switch (l->blending) {
+	case HWC_BLENDING_NONE:     blend = 0; break;
+	case HWC_BLENDING_PREMULT:  blend = 1; break;
+	case HWC_BLENDING_COVERAGE: blend = 2; break;
+	default: return -1;
+	}
+	if (c) {
+		c->state = R800_WIN_STATE_BUFFER;
+		c->fd_idma[0] = nh->data[0];
+		c->acq_fence = l->acquireFenceFd;
+		c->plane_alpha = l->planeAlpha;
+		c->blending = blend;
+		c->format = dfmt;
+		c->src = (struct r800_frame){ 0, 0, (uint32_t)sw, (uint32_t)sh, (uint32_t)stride, (uint32_t)sh };
+		c->dst = (struct r800_frame){ df->left, df->top, (uint32_t)dw, (uint32_t)dh, h->var.xres, h->var.yres };
+	}
+	return 0;
+}
+
+/* Present the overlay layers prepare() picked. 0 on success (fences filled). */
+static int ovl_present(struct r800_hwc *h, hwc_display_contents_1_t *c, int *retire)
+{
+	struct r800_win_config_data d;
+	int w;
+
+	memset(&d, 0, sizeof(d));
+	d.retire_fence = -1;
+	d.fd_odma = -1;
+	for (w = 0; w <= R800_MAX_DECON_WIN; w++) {
+		d.config[w].state = R800_WIN_STATE_DISABLED;
+		d.config[w].fd_idma[0] = d.config[w].fd_idma[1] = d.config[w].fd_idma[2] = -1;
+		d.config[w].acq_fence = d.config[w].rel_fence = -1;
+	}
+	for (w = 0; w < h->ovl_n; w++) {
+		if (ovl_layer(h, LAYER(c, h->ovl_idx[w]), &d.config[w]))
+			return -1;
+		d.config[w].channel = (uint32_t)w;
+	}
+	if (ioctl(h->fb_fd, R800_S3CFB_WIN_CONFIG, &d)) {
+		int e = errno;
+		if (h->ovl_fail++ < 10 || (h->ovl_fail % 600) == 0)
+			LOGE("overlay WIN_CONFIG (%d layers) failed: %s (%lu)", h->ovl_n, strerror(e), h->ovl_fail);
+		if (h->ovl_fail >= 5) {
+			LOGE("overlays disabled after %lu failures: GPU composition only", h->ovl_fail);
+			h->ovl_off = 1;
+		}
+		return -1;
+	}
+	for (w = 0; w < h->ovl_n; w++) {
+		hwc_layer_1_t *l = LAYER(c, h->ovl_idx[w]);
+		if (l->acquireFenceFd >= 0)
+			close(l->acquireFenceFd);
+		l->acquireFenceFd = -1;
+		if (d.config[w].rel_fence >= 0)
+			close(d.config[w].rel_fence);
+		/* DECON signals the retire fence when this frame has gone out to the
+		 * (command-mode) panel; the buffers are not read after that. */
+		l->releaseFenceFd = d.retire_fence >= 0 ? dup(d.retire_fence) : -1;
+	}
+	*retire = d.retire_fence;
+	if (h->ovl_frames++ < 3 || (h->ovl_frames % 1800) == 0)
+		LOGI("overlay frame %lu: %d layers (gpu frames %lu)", h->ovl_frames, h->ovl_n, h->gpu_frames);
+	return 0;
+}
+
+/* ---- HWC 1.1 entry points ---- */
+static int r800_prepare(hwc_composer_device_1_t *dev, size_t n, hwc_display_contents_1_t **displays)
+{
+	struct r800_hwc *h = (struct r800_hwc *)dev;
+	size_t i;
+	int nl = 0, ok;
+	if (n < 1 || !displays[0])
+		return 0;
+	h->no_buffer = 0;
+	ok = ovl_enabled(h);
+	for (i = 0; i < displays[0]->numHwLayers; i++) {
+		hwc_layer_1_t *l = LAYER(displays[0], i);
+		if ((l->compositionType == HWC_BACKGROUND || l->compositionType == HWC_SIDEBAND) && i < 64)
+			h->no_buffer |= 1ULL << i;
+		if (l->compositionType == HWC_FRAMEBUFFER_TARGET)
+			continue;
+		if (ok && (nl >= R800_MAX_DECON_WIN || ovl_layer(h, l, NULL)))
+			ok = 0;
+		else if (ok)
+			h->ovl_idx[nl++] = i;
+	}
+	h->ovl_n = ok ? nl : 0;
+	for (i = 0; i < displays[0]->numHwLayers; i++) {
+		hwc_layer_1_t *l = LAYER(displays[0], i);
+		if (l->compositionType != HWC_FRAMEBUFFER_TARGET)
+			l->compositionType = h->ovl_n ? HWC_OVERLAY : HWC_FRAMEBUFFER;
+	}
+	if (!h->ovl_n)
+		h->gpu_frames++;
+	return 0;
+}
+
+static void doze_resume(struct r800_hwc *h);
+static void doze_presented(struct r800_hwc *h);
+
+static int r800_set(hwc_composer_device_1_t *dev, size_t n, hwc_display_contents_1_t **displays)
+{
+	struct r800_hwc *h = (struct r800_hwc *)dev;
+	size_t d, i;
+
+	doze_resume(h);
+
+	static int calls;
+	/* setprop debug.r800.dumplayers N: log the next N frames' layer lists */
+	if ((calls % 60) == 0) {
+		char v[PROP_VALUE_MAX] = "";
+		__system_property_get("debug.r800.dumplayers", v);
+		h->dump_left = atoi(v) > 0 && atoi(v) != h->dump_seen ? atoi(v) : h->dump_left;
+		if (atoi(v) > 0)
+			h->dump_seen = atoi(v);
+		v[0] = 0;
+		__system_property_get("debug.r800.fencescan", v);
+		if (atoi(v) != h->fencescan_seen) {
+			h->fencescan_seen = atoi(v);
+			fence_scan();
+		}
+	}
+	if (h->dump_left > 0 && n > 0 && displays[0]) {
+		size_t j;
+		h->dump_left--;
+		LOGE("frame %d: %zu layers flags 0x%x", calls, displays[0]->numHwLayers, displays[0]->flags);
+		for (j = 0; j < displays[0]->numHwLayers; j++) {
+			hwc_layer_1_t *L = LAYER(displays[0], j);
+			LOGE("  L%zu type %d flags 0x%x handle %p acq %d blend 0x%x alpha %u disp %d,%d-%d,%d crop %.0f,%.0f-%.0f,%.0f",
+			     j, L->compositionType, L->flags, (void *)L->handle, L->acquireFenceFd, L->blending,
+			     L->planeAlpha, L->displayFrame.left, L->displayFrame.top, L->displayFrame.right,
+			     L->displayFrame.bottom, L->sourceCropf.left, L->sourceCropf.top, L->sourceCropf.right,
+			     L->sourceCropf.bottom);
+		}
+	}
+	if (calls++ < 3) {
+		size_t k;
+		LOGI("set #%d: numDisplays=%zu fb_mem=%p gralloc=%p blanked=%d", calls, n, h->fb_mem,
+		     (void *)h->gralloc, h->blanked);
+		for (k = 0; displays && k < n && displays[k] && k < 1; k++) {
+			size_t j;
+			for (j = 0; j < displays[k]->numHwLayers; j++)
+				LOGI("  disp %zu layer %zu type %d handle %p acq %d", k, j,
+				     LAYER(displays[k], j)->compositionType,
+				     (void *)LAYER(displays[k], j)->handle, LAYER(displays[k], j)->acquireFenceFd);
+		}
+	}
+	int presented = 0;
+
+	for (d = 0; d < n; d++) {
+		hwc_display_contents_1_t *c = displays[d];
+		buffer_handle_t fallback = NULL;
+		int retire = -1;
+
+		if (!c)
+			continue;
+		if (d == 0 && h->ovl_n > 0) {
+			/* prepare() marked these layers HWC_OVERLAY: nothing was composed
+			 * into the FB target. On failure the previous frame stays up. */
+			int w, ok = !h->blanked && ovl_present(h, c, &retire) == 0;
+			for (w = 0; w < h->ovl_n; w++) {
+				hwc_layer_1_t *l = LAYER(c, h->ovl_idx[w]);
+				if (!ok) {
+					if (l->acquireFenceFd >= 0)
+						close(l->acquireFenceFd);
+					l->acquireFenceFd = -1;
+					l->releaseFenceFd = -1;
+				}
+			}
+			for (i = 0; i < c->numHwLayers; i++) {
+				hwc_layer_1_t *l = LAYER(c, i);
+				if (l->compositionType == HWC_OVERLAY)
+					continue;          /* fences done above */
+				if (l->acquireFenceFd >= 0)
+					close(l->acquireFenceFd);
+				l->acquireFenceFd = -1;
+				l->releaseFenceFd = -1;
+			}
+			c->retireFenceFd = retire;
+			continue;
+		}
+		for (i = 0; i < c->numHwLayers; i++) {
+			hwc_layer_1_t *l = LAYER(c, i);
+			if (d == 0 && l->handle && l->compositionType != HWC_FRAMEBUFFER_TARGET &&
+			    !(i < 64 && (h->no_buffer >> i) & 1) && !(l->flags & HWC_SKIP_LAYER) &&
+			    handle_ok(l->handle))
+				fallback = l->handle;
+			l->releaseFenceFd = -1;
+			if (d == 0 && l->compositionType == HWC_FRAMEBUFFER_TARGET) {
+				if (!h->blanked && h->zerocopy && wc_present(h, l, &retire) == 0) {
+					presented = 1;
+					continue;
+				}
+				wait_fence(l->acquireFenceFd);
+				l->acquireFenceFd = -1;
+				if (!h->blanked) {
+					fb_present(h, l->handle, 1);
+					presented = 1;
+				}
+			} else if (l->acquireFenceFd >= 0) {
+				close(l->acquireFenceFd);
+				l->acquireFenceFd = -1;
+			}
+		}
+		/* No explicit FB target: present the last layer that has a buffer. */
+		if (d == 0 && !presented && !h->blanked && fallback) {
+			hwc_layer_1_t *fl = NULL;
+			for (i = 0; i < c->numHwLayers; i++)
+				if (LAYER(c, i)->handle == fallback)
+					fl = LAYER(c, i);
+			if (!(h->zerocopy && fl && wc_present(h, fl, &retire) == 0))
+				fb_present(h, fallback, 0);
+			presented = 1;
+		}
+		/* no usable layer: keep the last frame (was an orange debug fill) */
+		c->retireFenceFd = retire;
+	}
+	doze_presented(h);
+	return 0;
+}
+
+/*
+ * Vsync. The panel is a DSI command-mode panel: DECON timestamps its TE
+ * interrupt in decon->vsync.timestamp and, while S3CFB_SET_VSYNC_INT is on,
+ * signals the "vsync" sysfs node (POLLPRI) on every TE. Those are the real
+ * refresh times. When DECON hibernates (nothing to show) TE stops, so we
+ * fill in timer vsyncs on the grid of the last real one: SurfaceFlinger keeps
+ * a steady model and the next real TE lands where it expects it. A free
+ * running 60 Hz timer (the old scheme) drifts against the panel and makes
+ * frames miss their slot.
+ */
+#define R800_S3CFB_SET_VSYNC_INT _IOW('F', 206, uint32_t)
+#define R800_S3CFB_POWER_MODE _IOW('F', 223, uint32_t)
+#define R800_DISP_PWR_DOZE 1
+#define R800_DISP_PWR_DOZE_SUSPEND 3
+#define R800_VSYNC_NODE "/sys/devices/platform/148b0000.decon_f/vsync"
+
+static int64_t mono_ns(void)
+{
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (int64_t)t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+
+static int64_t read_hw_vsync(int fd)
+{
+	char buf[32];
+	ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
+	if (n <= 0)
+		return 0;
+	buf[n] = 0;
+	return strtoll(buf, NULL, 10);
+}
+
+static void *vsync_loop(void *arg)
+{
+	struct r800_hwc *h = arg;
+	int vfd = open(R800_VSYNC_NODE, O_RDONLY | O_CLOEXEC);
+	int64_t last_hw = 0, last_sent = 0;
+	unsigned long hw_count = 0, sw_count = 0;
+
+	if (vfd < 0)
+		LOGE("vsync: %s: %s, timer vsync only", R800_VSYNC_NODE, strerror(errno));
+	else
+		last_hw = read_hw_vsync(vfd);   /* arms POLLPRI */
+
+	for (;;) {
+		int64_t ts = 0, now;
+
+		pthread_mutex_lock(&h->lock);
+		while (!h->vsync_enabled)
+			pthread_cond_wait(&h->cond, &h->lock);
+		pthread_mutex_unlock(&h->lock);
+		{
+			static unsigned long wakes;
+			if (wakes++ < 8)
+				LOGI("vsync thread awake (vfd %d last_hw %lld now %lld)", vfd,
+				     (long long)last_hw, (long long)mono_ns());
+		}
+
+		if (vfd >= 0) {
+			/* up to ~1.3 periods for the next TE */
+			struct pollfd p = { .fd = vfd, .events = POLLPRI | POLLERR };
+			int pr = poll(&p, 1, 22);
+			{
+				static unsigned long polls;
+				if (polls++ < 12)
+					LOGI("vsync poll %d revents %#x", pr, p.revents);
+			}
+			if (pr > 0) {
+				int64_t hw = read_hw_vsync(vfd);
+				{
+					static unsigned long reads;
+					if (reads++ < 12)
+						LOGI("vsync read %lld (last %lld)", (long long)hw, (long long)last_hw);
+				}
+				if (hw > last_hw) {
+					last_hw = hw;
+					/* a timer vsync just covered this refresh */
+					if (hw > last_sent + VSYNC_PERIOD_NS / 2)
+						ts = hw;
+				}
+				if (ts)
+					hw_count++;
+				else
+					continue;
+			}
+		}
+
+		if (!ts) {
+			/* no TE: next point on the last real vsync's grid */
+			int64_t base = last_hw ? last_hw : (last_sent ? last_sent : mono_ns());
+			int64_t k;
+			now = mono_ns();
+			k = (now - base) / VSYNC_PERIOD_NS + 1;
+			ts = base + k * VSYNC_PERIOD_NS;
+			if (ts <= last_sent + VSYNC_PERIOD_NS / 2)
+				ts += VSYNC_PERIOD_NS;
+			{
+				struct timespec t = { (time_t)(ts / 1000000000LL), (long)(ts % 1000000000LL) };
+				clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t, NULL);
+			}
+			sw_count++;
+		}
+
+		if (hw_count + sw_count <= 6)
+			LOGI("vsync #%lu: %s ts=%lld", hw_count + sw_count,
+			     sw_count && ts != last_hw ? "filled" : "TE", (long long)ts);
+		last_sent = ts;
+		if (h->procs && h->procs->vsync && h->vsync_enabled)
+			h->procs->vsync(h->procs, 0, ts);
+		if (((hw_count + sw_count) & 1023) == 0)
+			LOGI("vsync: %lu from TE, %lu filled in", hw_count, sw_count);
+	}
+	return NULL;
+}
+
+static int r800_event_control(hwc_composer_device_1_t *dev, int disp, int event, int enabled)
+{
+	struct r800_hwc *h = (struct r800_hwc *)dev;
+	uint32_t on = !!enabled;
+	if (disp != 0 || event != HWC_EVENT_VSYNC)
+		return -EINVAL;
+	pthread_mutex_lock(&h->lock);
+	if (h->vsync_enabled != (int)on) {
+		int r = h->fb_fd >= 0 ? ioctl(h->fb_fd, R800_S3CFB_SET_VSYNC_INT, &on) : -1;
+		static unsigned long toggles;
+		if (toggles++ < 40)
+			LOGI("vsync %s (decon vsync int: %s)", on ? "on" : "off",
+			     r ? strerror(errno) : "ok");
+	}
+	h->vsync_enabled = on;
+	pthread_cond_signal(&h->cond);
+	pthread_mutex_unlock(&h->lock);
+	return 0;
+}
+
+static int r800_blank(hwc_composer_device_1_t *dev, int disp, int blank)
+{
+	struct r800_hwc *h = (struct r800_hwc *)dev;
+	/*
+	 * Screen off = DCS "display off" (0x28) through the DSIM cmd_rw node, with
+	 * DECON, DSIM and the panel logic left running: emission stops, and
+	 * "display on" (0x29) brings it straight back. A real power-down (or the
+	 * panel's sleep mode) cannot be undone without the Samsung init sequence:
+	 * the panel stops sending TE and later DCS writes stall. android-helper.sh
+	 * makes the node writable for us (we run as system).
+	 */
+	static const char *node = "/sys/devices/platform/148e0000.dsim/cmd_rw";
+	int fd;
+	char v[PROP_VALUE_MAX] = "";
+	if (disp != 0)
+		return -EINVAL;
+	blank = !!blank;
+	if (blank == h->blanked)
+		return 0;
+	/*
+	 * Kernel #66+ can re-initialise the panel after a real power-down (DECON
+	 * is set up before the panel init now), so screen off powers the panel,
+	 * DSIM and DECON down like Tizen does. debug.r800.realblank=0 falls back
+	 * to the DCS display-off below.
+	 */
+	__system_property_get("debug.r800.realblank", v);
+	if (v[0] != '0') {
+		if (ioctl(h->fb_fd, FBIOBLANK, blank ? FB_BLANK_POWERDOWN : FB_BLANK_UNBLANK) == 0) {
+			h->blanked = blank;
+			LOGI("panel %s (power)", blank ? "off" : "on");
+			return 0;
+		}
+		LOGE("FBIOBLANK %s: %s, falling back to DCS", blank ? "off" : "on", strerror(errno));
+	}
+	fd = open(node, O_WRONLY | O_CLOEXEC);
+	if (fd < 0 || write(fd, blank ? "3" : "2", 1) != 1) {
+		LOGE("%s: %s: %s", blank ? "display off" : "display on", node, strerror(errno));
+		if (fd >= 0)
+			close(fd);
+		/* could not switch the panel: keep presenting so the screen stays usable */
+		if (!blank)
+			h->blanked = 0;
+		return blank ? -EIO : 0;
+	}
+	close(fd);
+	h->blanked = blank;      /* set() skips presenting while the panel is off */
+	LOGI("panel %s", blank ? "display off" : "display on");
+	return 0;
+}
+
+/*
+ * HWC 1.4 power modes. OFF/NORMAL keep the blank() behaviour. DOZE and
+ * DOZE_SUSPEND (Wear OS ambient) go through DECON's S3CFB_POWER_MODE ioctl
+ * (CONFIG_EXYNOS_DOZE): DSIM then switches the panel to its low-power HLPM
+ * mode (panel driver doze op), and back out of it on the way to NORMAL.
+ */
+/*
+ * Ambient without HLPM (panel in normal mode at the lowest level): DECON and
+ * DSIM only need to run while a frame goes out. After
+ * vendor.hwc.r800.doze_idle_ms (default 300, 0 = off) without a frame, DECON
+ * goes to DOZE_SUSPEND (DECON/DSIM off, the command-mode panel keeps showing
+ * its frame from its own RAM); the next set() brings it back to DOZE first.
+ */
+static int doze_idle_ms(void)
+{
+	char v[PROP_VALUE_MAX] = "";
+	__system_property_get("vendor.hwc.r800.doze_idle_ms", v);
+	return v[0] ? atoi(v) : 300;
+}
+
+static void doze_resume(struct r800_hwc *h)
+{
+	pthread_mutex_lock(&h->doze_lock);
+	if (h->doze_susp && h->power_mode == HWC_POWER_MODE_DOZE) {
+		uint32_t pwr = R800_DISP_PWR_DOZE;
+		if (ioctl(h->fb_fd, R800_S3CFB_POWER_MODE, &pwr))
+			LOGE("doze resume: %s", strerror(errno));
+		h->doze_susp = 0;
+	}
+	pthread_mutex_unlock(&h->doze_lock);
+}
+
+static void doze_presented(struct r800_hwc *h)
+{
+	pthread_mutex_lock(&h->doze_lock);
+	h->last_present_ns = mono_ns();
+	pthread_cond_signal(&h->doze_cond);
+	pthread_mutex_unlock(&h->doze_lock);
+}
+
+static void *doze_idle_loop(void *arg)
+{
+	struct r800_hwc *h = arg;
+
+	pthread_mutex_lock(&h->doze_lock);
+	for (;;) {
+		int ms;
+		int64_t due;
+		struct timespec t;
+
+		while (h->power_mode != HWC_POWER_MODE_DOZE || h->doze_susp)
+			pthread_cond_wait(&h->doze_cond, &h->doze_lock);
+		ms = doze_idle_ms();
+		if (ms <= 0) {
+			/* disabled: look again in a while */
+			clock_gettime(CLOCK_REALTIME, &t);
+			t.tv_sec += 5;
+			pthread_cond_timedwait(&h->doze_cond, &h->doze_lock, &t);
+			continue;
+		}
+		due = h->last_present_ns + (int64_t)ms * 1000000LL;
+		if (mono_ns() < due) {
+			int64_t wait = due - mono_ns();
+			clock_gettime(CLOCK_REALTIME, &t);
+			t.tv_sec += wait / 1000000000LL;
+			t.tv_nsec += wait % 1000000000LL;
+			if (t.tv_nsec >= 1000000000L) {
+				t.tv_sec++;
+				t.tv_nsec -= 1000000000L;
+			}
+			pthread_cond_timedwait(&h->doze_cond, &h->doze_lock, &t);
+			continue;   /* re-check: a frame or a mode change may have come */
+		}
+		{
+			uint32_t pwr = R800_DISP_PWR_DOZE_SUSPEND;
+			if (ioctl(h->fb_fd, R800_S3CFB_POWER_MODE, &pwr)) {
+				LOGE("doze suspend: %s", strerror(errno));
+				h->last_present_ns = mono_ns() + 10000000000LL;   /* back off 10 s */
+				continue;
+			}
+			h->doze_susp = 1;
+			if (h->doze_suspends++ < 20)
+				LOGI("doze: DECON suspended after %d ms idle", ms);
+		}
+	}
+	return NULL;
+}
+
+static int r800_set_power_mode(hwc_composer_device_1_t *dev, int disp, int mode)
+{
+	struct r800_hwc *h = (struct r800_hwc *)dev;
+	int prev = h->power_mode, r = 0;
+	uint32_t pwr;
+
+	if (disp != 0)
+		return -EINVAL;
+	LOGI("setPowerMode %d -> %d", prev, mode);
+	pthread_mutex_lock(&h->doze_lock);
+	switch (mode) {
+	case HWC_POWER_MODE_OFF:
+		r = r800_blank(dev, disp, 1);
+		break;
+	case HWC_POWER_MODE_NORMAL:
+		if (prev == HWC_POWER_MODE_DOZE || prev == HWC_POWER_MODE_DOZE_SUSPEND) {
+			/* FBIOBLANK unblank takes DECON/DSIM from DOZE to ON (panel wake) */
+			if (ioctl(h->fb_fd, FBIOBLANK, FB_BLANK_UNBLANK))
+				LOGE("unblank from doze: %s", strerror(errno));
+			h->blanked = 0;
+		} else {
+			r = r800_blank(dev, disp, 0);
+		}
+		break;
+	case HWC_POWER_MODE_DOZE:
+	case HWC_POWER_MODE_DOZE_SUSPEND:
+		pwr = mode == HWC_POWER_MODE_DOZE ? R800_DISP_PWR_DOZE : R800_DISP_PWR_DOZE_SUSPEND;
+		if (ioctl(h->fb_fd, R800_S3CFB_POWER_MODE, &pwr)) {
+			/* no kernel doze: behave like HWC 1.1 did (panel stays on) */
+			LOGE("S3CFB_POWER_MODE %u: %s", pwr, strerror(errno));
+			r = r800_blank(dev, disp, 0);
+		} else {
+			h->blanked = 0;
+		}
+		break;
+	default:
+		pthread_mutex_unlock(&h->doze_lock);
+		return -EINVAL;
+	}
+	h->doze_susp = mode == HWC_POWER_MODE_DOZE_SUSPEND;
+	h->power_mode = mode;
+	h->last_present_ns = mono_ns();
+	pthread_cond_signal(&h->doze_cond);
+	pthread_mutex_unlock(&h->doze_lock);
+	return r;
+}
+
+static int r800_get_active_config(hwc_composer_device_1_t *dev, int disp)
+{
+	(void)dev;
+	return disp == 0 ? 0 : -1;
+}
+
+static int r800_set_active_config(hwc_composer_device_1_t *dev, int disp, int index)
+{
+	(void)dev;
+	return disp == 0 && index == 0 ? 0 : -EINVAL;
+}
+
+static int r800_query(hwc_composer_device_1_t *dev, int what, int *value)
+{
+	(void)dev;
+	switch (what) {
+	case HWC_BACKGROUND_LAYER_SUPPORTED: *value = 0; return 0;
+	case HWC_VSYNC_PERIOD:               *value = (int)VSYNC_PERIOD_NS; return 0;
+	case HWC_DISPLAY_TYPES_SUPPORTED:    *value = HWC_DISPLAY_PRIMARY_BIT; return 0;
+	default:                             return -EINVAL;
+	}
+}
+
+static void r800_register_procs(hwc_composer_device_1_t *dev, hwc_procs_t const *procs)
+{
+	((struct r800_hwc *)dev)->procs = procs;
+}
+
+static int r800_get_display_configs(hwc_composer_device_1_t *dev, int disp, uint32_t *configs, size_t *num)
+{
+	(void)dev;
+	if (disp != 0)
+		return -EINVAL;
+	if (*num > 0)
+		configs[0] = 0;
+	*num = 1;
+	return 0;
+}
+
+static int r800_get_display_attributes(hwc_composer_device_1_t *dev, int disp, uint32_t config,
+				       const uint32_t *attrs, int32_t *values)
+{
+	struct r800_hwc *h = (struct r800_hwc *)dev;
+	/* 33 mm panel, 360 px -> ~277 dpi; HWC wants dpi * 1000 */
+	int32_t dpi_x = h->var.width ? (int32_t)(h->var.xres * 25400000LL / h->var.width) : 277000;
+	int32_t dpi_y = h->var.height ? (int32_t)(h->var.yres * 25400000LL / h->var.height) : 277000;
+	int i;
+	(void)config;
+	if (disp != 0)
+		return -EINVAL;
+	for (i = 0; attrs[i] != HWC_DISPLAY_NO_ATTRIBUTE; i++) {
+		switch (attrs[i]) {
+		case HWC_DISPLAY_VSYNC_PERIOD: values[i] = (int32_t)VSYNC_PERIOD_NS; break;
+		case HWC_DISPLAY_WIDTH:        values[i] = (int32_t)h->var.xres; break;
+		case HWC_DISPLAY_HEIGHT:       values[i] = (int32_t)h->var.yres; break;
+		case HWC_DISPLAY_DPI_X:        values[i] = dpi_x; break;
+		case HWC_DISPLAY_DPI_Y:        values[i] = dpi_y; break;
+		default:                       values[i] = 0; break;
+		}
+	}
+	return 0;
+}
+
+static void r800_dump(hwc_composer_device_1_t *dev, char *buf, int len)
+{
+	struct r800_hwc *h = (struct r800_hwc *)dev;
+	snprintf(buf, len, "hwc-r800: %ux%u frames=%lu vsync=%d blanked=%d overlay frames=%lu gpu=%lu fail=%lu fmt=%d off=%d\n",
+		 h->var.xres, h->var.yres, h->frames, h->vsync_enabled, h->blanked, h->ovl_frames,
+		 h->gpu_frames, h->ovl_fail, h->fmt_verified, h->ovl_off);
+}
+
+static int r800_close(hw_device_t *dev)
+{
+	(void)dev;
+	return 0;   /* lives for the process lifetime */
+}
+
+static int r800_open(const hw_module_t *module, const char *name, hw_device_t **device)
+{
+	struct r800_hwc *h;
+
+	if (strcmp(name, HWC_HARDWARE_COMPOSER))
+		return -EINVAL;
+	h = calloc(1, sizeof(*h));
+	if (!h)
+		return -ENOMEM;
+	h->fb_fd = -1;
+	pthread_mutex_init(&h->lock, NULL);
+	pthread_cond_init(&h->cond, NULL);
+	pthread_mutex_init(&h->doze_lock, NULL);
+	pthread_cond_init(&h->doze_cond, NULL);
+
+	h->power_mode = HWC_POWER_MODE_NORMAL;   /* the panel is on at start */
+	h->base.common.tag = HARDWARE_DEVICE_TAG;
+	h->base.common.version = HWC_DEVICE_API_VERSION_1_4;
+	h->base.common.module = (hw_module_t *)module;
+	h->base.common.close = r800_close;
+	h->base.prepare = r800_prepare;
+	h->base.set = r800_set;
+	h->base.eventControl = r800_event_control;
+	h->base.setPowerMode = r800_set_power_mode;   /* 1.4: replaces blank() */
+	h->base.getActiveConfig = r800_get_active_config;
+	h->base.setActiveConfig = r800_set_active_config;
+	h->base.query = r800_query;
+	h->base.registerProcs = r800_register_procs;
+	h->base.dump = r800_dump;
+	h->base.getDisplayConfigs = r800_get_display_configs;
+	h->base.getDisplayAttributes = r800_get_display_attributes;
+
+	if (fb_open(h)) {
+		LOGE("framebuffer unavailable (errno %d): frames will be dropped", errno);
+	} else {
+		LOGE("fb ok: %ux%u %ubpp smem=%u", h->var.xres, h->var.yres,
+		     h->var.bits_per_pixel, h->fix.smem_len);
+	}
+	h->gralloc = load_gralloc();
+	pthread_create(&h->vsync_thread, NULL, vsync_loop, h);
+	pthread_create(&h->idle_thread, NULL, doze_idle_loop, h);
+
+	if (h->fb_mem) {
+		/* The initramfs had fb0 open and released it at handover, which
+		 * powers the panel down; unblank + re-apply the mode to wake it.
+		 * Only on the first open after boot: on a composer restart DECON is
+		 * still running (release keeps it on) and may be in window-config
+		 * mode, and re-applying the mode there is the suspect for the
+		 * restart hang. The property survives composer restarts. */
+		char woke[PROP_VALUE_MAX] = "";
+		__system_property_get("debug.r800.hwc_woke", woke);
+		if (woke[0] != '1') {
+			h->var.activate = FB_ACTIVATE_NOW;
+			ioctl(h->fb_fd, FBIOPUT_VSCREENINFO, &h->var);
+			if (ioctl(h->fb_fd, FBIOBLANK, FB_BLANK_UNBLANK))
+				LOGE("unblank: %s", strerror(errno));
+			else
+				LOGE("unblanked panel");
+			if (__system_property_set("debug.r800.hwc_woke", "1"))
+				LOGE("could not set debug.r800.hwc_woke");
+		} else {
+			LOGE("composer restart: DECON left as is (no mode re-apply/unblank)");
+		}
+		/* no bring-up paint: after a composer restart the last frame stays */
+	}
+	*device = &h->base.common;
+	LOGI("opened (HWC 1.4, DECON overlays for <=3 plain layers, else client composition -> DECON zero-copy)");
+	return 0;
+}
+
+static struct hw_module_methods_t r800_methods = { .open = r800_open };
+
+hwc_module_t HAL_MODULE_INFO_SYM = {
+	.common = {
+		.tag = HARDWARE_MODULE_TAG,
+		.module_api_version = HWC_MODULE_API_VERSION_0_1,
+		.hal_api_version = HARDWARE_HAL_API_VERSION,
+		.id = HWC_HARDWARE_MODULE_ID,
+		.name = "SM-R800 framebuffer hwcomposer",
+		.author = "r800 bring-up",
+		.methods = &r800_methods,
+	},
+};

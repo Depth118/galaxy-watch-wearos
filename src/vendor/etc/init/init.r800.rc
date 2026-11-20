@@ -1,0 +1,31 @@
+# SM-R800 (Exynos 9110) bring-up vendor init, first Android boot test.
+# /oem = Tizen's user partition (p17, read-only), holds our busybox tools.
+
+on early-init
+    write /proc/sys/kernel/printk_devkmsg on
+
+on init
+    start r800helper
+
+on fs
+    mount_all /vendor/etc/fstab.r800
+
+on post-fs-data
+    mkdir /data/vendor 0771 root root
+    mkdir /data/vendor/log 0771 root root
+
+# Feeds the dead-man watchdog for up to 10 min and mirrors logcat into the
+# kernel log (which survives into Tizen's /proc/last_kmsg).
+service r800helper /oem/r800dev/bin/busybox sh /oem/r800dev/android-helper.sh
+    class core
+    user root
+    group root
+    disabled
+    oneshot
+    # busybox on p17 has no Android label; run it in an existing domain (permissive bring-up)
+    seclabel u:r:shell:s0
+
+# lights HAL (sec-light-hal-2-0 runs as system) writes the panel backlight
+on boot
+    chown system system /sys/class/backlight/exynos_panel/brightness
+    chmod 0664 /sys/class/backlight/exynos_panel/brightness

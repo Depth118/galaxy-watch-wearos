@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SM-R800 bezel: 24 detents per turn. Wear OS apps then scroll one item per
+     click with an animation instead of treating it as a high-res crown.
+     The Pixel image also declares rotary_encoder_fling (crown flings), which
+     misbehaves with click input: quick clicks flung and snapped back. -->
+<permissions>
+    <feature name="android.hardware.rotaryencoder.lowres" />
+    <unavailable-feature name="android.software.rotary_encoder_fling" />
+</permissions>

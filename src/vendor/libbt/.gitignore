@@ -1,0 +1,4 @@
+work/
+libbt-vendor.so
+shim/vnd_buildcfg.h
+shim/bdroid_buildcfg.h

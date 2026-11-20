@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.r800.overlay.orbita">
+    <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="28"/>
+    <overlay android:targetPackage="com.google.android.wearable.watchface.rwf" android:isStatic="true" android:priority="900"/>
+    <application android:hasCode="false"/>
+</manifest>
