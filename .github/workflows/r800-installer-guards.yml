@@ -1,0 +1,26 @@
+name: SM-R800 NetOdin fail-closed checks
+
+on:
+  push:
+    branches:
+      - "hardening/**"
+  pull_request:
+    paths:
+      - "installer/netodin.py"
+      - "installer/r800_safety.py"
+      - "tests/test_installer_guard.py"
+      - ".github/workflows/r800-installer-guards.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  offline-installer-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile installer Python files
+        run: python3 -m py_compile installer/netodin.py installer/r800_safety.py
+      - name: Offline synthetic PIT and firmware tests (no device access)
+        run: python3 -m unittest discover -s tests -p 'test_installer_guard.py' -v
