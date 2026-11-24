@@ -15,6 +15,7 @@ import tarfile
 import hashlib
 import time
 import argparse
+import r800_safety
 
 # Protocol Constants
 ODIN_PORT = 13579
@@ -26,21 +27,7 @@ CMD_PIT = 101           # 0x65
 CMD_FILE_TRANSFER = 102 # 0x66
 CMD_SESSION_END = 103   # 0x67
 
-# Default Partition Map for Galaxy Watch (SM-R810)
-FALLBACK_PIT_MAP = {
-    "sboot.bin": 80,
-    "param.bin": 9,
-    "dzImage": 11,
-    "dzImage-recovery": 12,
-    "ramdisk.img": 8,
-    "ramdisk-recovery.img": 7,
-    "rootfs.img": 18,
-    "system-data.img": 16,
-    "user.img": 17,
-    "csc.img": 15,
-    "nad_refer.bin": 3,
-    "nad_fw.bin": 13,
-}
+# No hardcoded PIT fallback is ever permitted for a flash operation.
 
 
 def build_control_packet(cmd: int, sub: int, data=None, str1: str = "", str2: str = "") -> bytes:
@@ -67,6 +54,8 @@ def send_control_packet(sock: socket.socket, cmd: int, sub: int, data=None, str1
         return (0, 0)
     resp = recv_exact(sock, 8)
     ack_cmd, ack_status = struct.unpack("<II", resp)
+    if ack_cmd != cmd:
+        raise IOError(f"Unexpected Odin ACK command {ack_cmd}, expected {cmd}")
     return (ack_cmd, ack_status)
 
 
@@ -79,62 +68,6 @@ def recv_exact(sock: socket.socket, length: int) -> bytes:
             raise ConnectionResetError(f"Socket closed unexpectedly while waiting for {length - len(buf)} bytes.")
         buf.extend(chunk)
     return bytes(buf)
-
-
-def verify_md5(filepath: str) -> bool:
-    """Verifies Samsung .tar.md5 checksum."""
-    file_size = os.path.getsize(filepath)
-    if file_size < 256:
-        return False
-    with open(filepath, "rb") as f:
-        f.seek(-256, 2)
-        tail = f.read()
-        m = re.search(rb"([a-fA-F0-9]{32})\s+([^\r\n]+)", tail)
-        if not m:
-            print("  [!] No standard MD5 trailer detected; skipping checksum check.")
-            return True
-
-        md5_expected = m.group(1).decode("ascii").lower()
-        start_pos = tail.find(m.group(0))
-        tar_data_size = file_size - len(tail) + start_pos
-
-        f.seek(0)
-        h = hashlib.md5()
-        remaining = tar_data_size
-        print(f"  [*] Verifying MD5 checksum ({tar_data_size / 1024 / 1024:.2f} MB)...", end="", flush=True)
-        while remaining > 0:
-            block = f.read(min(remaining, 4 * 1024 * 1024))
-            if not block:
-                break
-            h.update(block)
-            remaining -= len(block)
-        calc_md5 = h.hexdigest().lower()
-        if calc_md5 == md5_expected:
-            print(" [PASS]")
-            return True
-        else:
-            print(f" [FAIL]\n  [!] MD5 Mismatch: Expected {md5_expected}, got {calc_md5}")
-            return False
-
-
-def parse_pit(pit_bytes: bytes) -> dict:
-    """Parses a Samsung PIT binary table into a filename -> partition_id dict."""
-    pit_map = dict(FALLBACK_PIT_MAP)
-    try:
-        magic, count = struct.unpack_from("<II", pit_bytes, 0)
-        if magic != 0x12349876:
-            return pit_map
-        for i in range(count):
-            entry = pit_bytes[28 + i * 132 : 28 + (i + 1) * 132]
-            if len(entry) < 132:
-                break
-            part_id = struct.unpack_from("<I", entry, 8)[0]
-            filename = entry[68:100].rstrip(b"\x00").decode("latin1", errors="ignore")
-            if filename:
-                pit_map[filename] = part_id
-    except Exception as e:
-        print(f"  [!] Failed to parse PIT: {e}")
-    return pit_map
 
 
 def format_progress(prefix: str, current: int, total: int, start_time: float):
@@ -150,24 +83,21 @@ def format_progress(prefix: str, current: int, total: int, start_time: float):
 
 def flash_ap_package(ap_path: str, host: str = "0.0.0.0", port: int = ODIN_PORT, auto_reboot: bool = True):
     print("=" * 72)
-    print("  NetOdin Python Flasher (Samsung Galaxy Watch SM-R810)")
+    print("  NetOdin Python Flasher (Samsung Galaxy Watch SM-R800)")
     print("=" * 72)
 
     if not os.path.isfile(ap_path):
         print(f"[-] Error: File not found: {ap_path}")
         sys.exit(1)
 
-    # 1. MD5 Verification
-    if ap_path.endswith(".md5"):
-        print("[*] Checking package integrity...")
-        if not verify_md5(ap_path):
-            print("[-] Integrity check failed! Aborting flash.")
-            sys.exit(1)
+    # Do not open a listening socket until all local archive checks pass.
+    print("[*] Strict SM-R800 firmware preflight...")
+    r800_safety.preflight_file(ap_path)
 
     # 2. Inspect AP Tar file members (skip .pit table files from partition flash list)
     print(f"[*] Analyzing firmware package: {os.path.basename(ap_path)}")
     tar_obj = tarfile.open(ap_path, "r:")
-    members = [m for m in tar_obj.getmembers() if m.isfile() and not m.name.endswith(".pit")]
+    members = r800_safety.validate_archive(tar_obj)
     total_payload = sum(m.size for m in members)
     print(f"  [+] Found {len(members)} partitions to flash (Total: {total_payload / 1024 / 1024:.2f} MB):")
     for m in members:
@@ -185,12 +115,19 @@ def flash_ap_package(ap_path: str, host: str = "0.0.0.0", port: int = ODIN_PORT,
     print("  1. Put Galaxy Watch in 'Download (Wireless)' AP Mode:")
     print("     - Hold Power button ~10s until 'Rebooting...'")
     print("     - Quickly tap Power 3x -> Highlight 'Download (Wireless)' -> Long-press")
-    print("     - Rapidly double-press Power to switch to 'Access Point: SM-R810-xxxx'")
-    print("  2. Connect your Mac/Linux Wi-Fi to 'SM-R810-xxxx'")
+    print("     - Rapidly double-press Power to switch to 'Access Point: SM-R800'")
+    print("  2. Connect your Mac/Linux Wi-Fi to 'SM-R800'")
     print("  3. Waiting for connection from watch...")
     print("-" * 72)
 
-    sock, client_addr = srv.accept()
+    srv.settimeout(120)
+    try:
+        sock, client_addr = srv.accept()
+    except socket.timeout as exc:
+        srv.close()
+        tar_obj.close()
+        raise TimeoutError("No Odin connection after 120 s. Check Wi-Fi AP IP, "
+                           "inbound TCP/13579 and other devices joining the AP.") from exc
     print(f"[+] Watch connected from {client_addr[0]}:{client_addr[1]}!")
     sock.settimeout(300.0)  # 5 min timeout
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -224,7 +161,7 @@ def flash_ap_package(ap_path: str, host: str = "0.0.0.0", port: int = ODIN_PORT,
         # Step 5: Read PIT table from device
         print("[*] Requesting partition table (PIT) from device...")
         ack_cmd, pit_size = send_control_packet(sock, CMD_PIT, 1, expect_resp=True)
-        pit_map = dict(FALLBACK_PIT_MAP)
+        pit_map = None  # Never fall back to guessed partition IDs for writes
         if ack_cmd == CMD_PIT and 0 < pit_size < 100000:
             print(f"  [+] Device PIT size: {pit_size} bytes. Downloading...")
             pit_data = bytearray()
@@ -237,10 +174,11 @@ def flash_ap_package(ap_path: str, host: str = "0.0.0.0", port: int = ODIN_PORT,
                 pit_data.extend(chunk)
             # Finalize PIT transfer
             send_control_packet(sock, CMD_PIT, 3, expect_resp=True)
-            pit_map = parse_pit(bytes(pit_data))
+            pit_map = r800_safety.parse_pit_strict(bytes(pit_data))
+            r800_safety.validate_r800_pit(pit_map)
             print(f"  [+] Successfully parsed device PIT ({len(pit_map)} partition mappings).")
         else:
-            print("  [!] Device did not supply PIT; using authentic SM-R810 hardware PIT map.")
+            raise r800_safety.SafetyError("No valid live PIT; refusing all writes.")
 
         # Step 6: Stream each partition file in the AP archive
         print("\n" + "=" * 72)
@@ -250,7 +188,7 @@ def flash_ap_package(ap_path: str, host: str = "0.0.0.0", port: int = ODIN_PORT,
         for f_idx, member in enumerate(members):
             filename = member.name
             file_size = member.size
-            part_id = pit_map.get(filename, 0)
+            part_id = pit_map[filename]  # Live, fully validated PIT only
 
             print(f"\n[*] [{f_idx + 1}/{len(members)}] Preparing: {filename} (ID: {part_id}, Size: {file_size / 1024 / 1024:.2f} MB)")
 
@@ -303,7 +241,7 @@ def flash_ap_package(ap_path: str, host: str = "0.0.0.0", port: int = ODIN_PORT,
                     raise IOError(f"eMMC Write error for {filename} (Status: 0x{ack_status:08X})")
 
             sys.stdout.write("\n")
-            print(f"  [+] {filename} written and verified successfully.")
+            print(f"  [+] {filename}: write acknowledged by device (NO read-back verification).")
 
         # Step 7: Close Session & Reboot
         print("\n" + "=" * 72)
@@ -360,6 +298,8 @@ def reboot_only(host: str = "0.0.0.0", port: int = ODIN_PORT):
 def main():
     parser = argparse.ArgumentParser(description="NetOdin Python Flasher for Samsung Galaxy Watch / Tizen")
     parser.add_argument("--reboot-only", action="store_true", help="Only handshake and reboot the watch; flash nothing")
+    parser.add_argument("--preflight-only", action="store_true", help="Validate local archive; no network or writes")
+    parser.add_argument("--confirm-r800", action="store_true", help="Explicitly accept risky SM-R800 live flashing")
     parser.add_argument("--ap", required=False, help="Path to firmware package (.tar or .tar.md5)")
     parser.add_argument("--port", type=int, default=ODIN_PORT, help=f"TCP port to listen on (default: {ODIN_PORT})")
     parser.add_argument("--host", default="0.0.0.0", help="Host interface to bind (default: 0.0.0.0)")
@@ -371,6 +311,13 @@ def main():
         return
     if not args.ap:
         parser.error("--ap is required unless --reboot-only is given")
+    if args.preflight_only:
+        r800_safety.preflight_file(args.ap)
+        print("[PASS] Offline package checks only. Device compatibility NOT proven.")
+        return
+    if not args.confirm_r800:
+        parser.error("Live flashing requires --confirm-r800 after --preflight-only. "
+                     "Bootloader compatibility and physical recovery remain unverified.")
     flash_ap_package(args.ap, host=args.host, port=args.port, auto_reboot=not args.no_reboot)
 
 
