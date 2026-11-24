@@ -1,0 +1,25 @@
+name: SM-R800 offline power-policy tests
+
+on:
+  push:
+    branches:
+      - "hardening/**"
+  pull_request:
+    paths:
+      - "payload/android-helper.sh"
+      - "tests/test_power_policy.py"
+      - ".github/workflows/r800-power-policy.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  offline-power-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate full shell syntax
+        run: sh -n payload/android-helper.sh
+      - name: Run four-mode policy tests with mocked sysfs paths
+        run: python3 -m unittest discover -s tests -p 'test_power_policy.py' -v
