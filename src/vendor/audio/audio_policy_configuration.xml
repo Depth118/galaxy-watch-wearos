@@ -3,7 +3,8 @@
      Bluetooth A2DP through the system's legacy a2dp module (no offload). No
      remote submix: the donor vendor's r_submix module needs libnbaio_mono.so,
      which it doesn't have. Microphone: the one DMIC, 48 kHz (AudioFlinger resamples
-     for other rates). Volume curves: framework defaults. -->
+     for other rates). Volume curves: standard AOSP audio_policy_volumes.xml and
+     default_volume_tables.xml. -->
 <audioPolicyConfiguration version="1.0" xmlns:xi="http://www.w3.org/2001/XInclude">
     <globalConfiguration speaker_drc_enabled="false"/>
 
@@ -63,4 +64,6 @@
             </routes>
         </module>
     </modules>
+    <xi:include href="audio_policy_volumes.xml"/>
+    <xi:include href="default_volume_tables.xml"/>
 </audioPolicyConfiguration>
