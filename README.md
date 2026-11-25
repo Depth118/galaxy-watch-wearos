@@ -105,6 +105,8 @@ ignores.
   exceptions:
   - `src/kernel/r800-wearos.patch` is under GPL-2.0, like the kernel.
   - `src/hal/include` holds Android headers under Apache-2.0.
+  - `src/vendor/audio/audio_policy_volumes.xml` and
+    `src/vendor/audio/default_volume_tables.xml` are from AOSP under Apache-2.0.
   - `installer/netodin.py` comes from
     [prakashdivyy/py-netodin](https://github.com/prakashdivyy/py-netodin), with a
     reboot-only mode added. Its own terms apply.

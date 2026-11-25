@@ -25,17 +25,12 @@ mkdir -p /mnt/j4; umount /mnt/j4 2>/dev/null || true
 mount -o loop,ro /root/android/j4_vendor.img /mnt/j4
 rm -f $OUT/lib/hw/gralloc.default.so $OUT/lib/hw/android.hardware.graphics.allocator@2.0-impl.so $OUT/lib/hw/android.hardware.graphics.mapper@2.0-impl.so       $OUT/bin/hw/android.hardware.graphics.allocator@2.0-service $OUT/etc/init/android.hardware.graphics.allocator@2.0-service.rc
 ( cd /mnt/j4 && tar --xattrs --xattrs-include='*' -cf -   ./lib/egl/libGLES_mali.so ./lib/hw/gralloc.exynos5.so   ./lib/hw/android.hardware.graphics.allocator@2.0-impl.so ./lib/hw/android.hardware.graphics.mapper@2.0-impl.so   ./lib/hw/android.hardware.graphics.composer@2.1-impl.so ./lib/libhwc2on1adapter.so ./lib/libhwc2onfbadapter.so   ./lib/libion_exynos.so ./lib/hw/memtrack.universal7570.so ./lib/hw/android.hardware.memtrack@1.0-impl.so   ./bin/hw/android.hardware.graphics.allocator@2.0-service ./bin/hw/android.hardware.graphics.composer@2.1-service   ./bin/hw/android.hardware.memtrack@1.0-service   ./etc/init/android.hardware.graphics.allocator@2.0-service.rc ./etc/init/android.hardware.graphics.composer@2.1-service.rc   ./etc/init/android.hardware.memtrack@1.0-service.rc ) | tar --xattrs --xattrs-include='*' -C $OUT -xpf -
-# ---- keymaster 3.0 + gatekeeper (keystore aborts without them) ----
+# ---- keymaster 3.0 (gatekeeper omitted: J4 gatekeeper.exynos7570.so crashes; gatekeeperd falls back to SoftGateKeeperDevice) ----
 for f in \
     ./bin/hw/android.hardware.keymaster@3.0-service \
-    ./bin/hw/android.hardware.gatekeeper@1.0-service \
     ./etc/init/android.hardware.keymaster@3.0-service.rc \
-    ./etc/init/android.hardware.gatekeeper@1.0-service.rc \
     ./lib/hw/android.hardware.keymaster@3.0-impl.so \
-    ./lib/hw/android.hardware.gatekeeper@1.0-impl.so \
-    ./lib/hw/gatekeeper.exynos7570.so \
     ./lib/android.hardware.keymaster@3.0.so \
-    ./lib/android.hardware.gatekeeper@1.0.so \
     ./lib/libsoftkeymasterdevice.so \
     ./lib/libkeymaster_portable.so \
     ./lib/libpuresoftkeymasterdevice.so \
@@ -48,12 +43,9 @@ for f in \
         echo "km: MISSING $f"
     fi
 done
-for f in $OUT/etc/init/android.hardware.keymaster@3.0-service.rc \
-         $OUT/etc/init/android.hardware.gatekeeper@1.0-service.rc ; do
-    if [ -e "$f" ]; then
-        setfattr -n security.selinux -v u:object_r:vendor_configs_file:s0 "$f"
-    fi
-done
+if [ -e "$OUT/etc/init/android.hardware.keymaster@3.0-service.rc" ]; then
+    setfattr -n security.selinux -v u:object_r:vendor_configs_file:s0 "$OUT/etc/init/android.hardware.keymaster@3.0-service.rc"
+fi
 
 # ---- audio HAL 2.0 (audioserver aborts without it; system_server waits on audio_policy) ----
 for f in \
@@ -149,6 +141,17 @@ P2
 S=/mnt/d/r800/vendor_r800_src
 cp $S/etc/init/init.r800.rc $OUT/etc/init/; cp $S/etc/fstab.r800 $OUT/etc/; cp $S/ueventd.rc $OUT/
 cp $S/etc/vintf/manifest.xml $OUT/etc/vintf/manifest.xml
+# Enable PIN/pattern lock screen (LockPatternUtils checks android.software.secure_lock_screen)
+cat > $OUT/etc/permissions/android.software.secure_lock_screen.xml <<'SLS'
+<?xml version="1.0" encoding="utf-8"?>
+<permissions>
+    <feature name="android.software.secure_lock_screen" />
+</permissions>
+SLS
+chmod 644 $OUT/etc/permissions/android.software.secure_lock_screen.xml
+setfattr -n security.selinux -v u:object_r:vendor_configs_file:s0 $OUT/etc/permissions/android.software.secure_lock_screen.xml
+# Drop leftover donor NFC feature declarations (SM-R800 has no NFC HAL; avoids GMS NfcAdapter NPE loop)
+rm -f $OUT/etc/permissions/com.nxp.mifare.xml $OUT/etc/permissions/android.hardware.nfc.hce.xml $OUT/etc/permissions/android.hardware.nfc.hcef.xml
 # our HWC 1.1 module (client composition -> fb0 copy + pan), built with the NDK
 cp $S/hwcomposer.r800.so $OUT/lib/hw/hwcomposer.r800.so
 setfattr -n security.selinux -v u:object_r:vendor_file:s0 $OUT/lib/hw/hwcomposer.r800.so
