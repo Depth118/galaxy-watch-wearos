@@ -15,6 +15,28 @@ chmod 644 $M/etc/init/android.hardware.vibrator@1.0-service.rc $M/lib/hw/android
 setfattr -n security.selinux -v u:object_r:hal_vibrator_default_exec:s0 $M/bin/hw/android.hardware.vibrator@1.0-service
 setfattr -n security.selinux -v u:object_r:vendor_configs_file:s0 $M/etc/init/android.hardware.vibrator@1.0-service.rc
 setfattr -n security.selinux -v u:object_r:vendor_file:s0 $M/lib/hw/android.hardware.vibrator@1.0-impl.so $M/lib/hw/vibrator.default.so
+# ClockworkSettings' VibrationSettingsFragment.onCreatePreferences() loads
+# prefs_vibration_legacy.xml when Vibrator.hasAmplitudeControl() is false, then
+# unconditionally calls initSilenceWhenNotWorn() on pref_silenceWhenNotWorn which
+# only exists in prefs_vibration.xml and crashes with NullPointerException.
+# Patch Vibrator::supportsAmplitudeControl() -> true and setAmplitude() -> OK
+# in the donor android.hardware.vibrator@1.0-impl.so (guarded by exact bytes).
+python3 - "$M/lib/hw/android.hardware.vibrator@1.0-impl.so" <<'PY'
+import sys
+p = sys.argv[1]
+with open(p, "rb") as f:
+    b = bytearray(f.read())
+orig_sup = bytes.fromhex("0021c0ef50001222c0f80e1040f9820a01607047")
+orig_set = bytes.fromhex("00210322c0ef5000c0f80d108261112240f9820a01607047")
+assert b[0x1ac0:0x1ad4] == orig_sup, f"unexpected supportsAmplitudeControl bytes: {b[0x1ac0:0x1ad4].hex()}"
+assert b[0x1ad4:0x1aec] == orig_set, f"unexpected setAmplitude bytes: {b[0x1ad4:0x1aec].hex()}"
+b[0x1ac0:0x1ad4] = bytes.fromhex("0021c0ef500040f98f0a01610175012141757047")
+b[0x1ad4:0x1aec] = bytes.fromhex("00210022c0ef5000c0f80d108261112240f9820a01607047")
+with open(p, "wb") as f:
+    f.write(b)
+PY
+chmod 644 $M/lib/hw/android.hardware.vibrator@1.0-impl.so
+setfattr -n security.selinux -v u:object_r:vendor_file:s0 $M/lib/hw/android.hardware.vibrator@1.0-impl.so
 mkdir -p $M/usr/idc
 cp /mnt/d/r800/upstream/detent/tizen_detent.idc $M/usr/idc/tizen_detent.idc
 chmod 644 $M/usr/idc/tizen_detent.idc

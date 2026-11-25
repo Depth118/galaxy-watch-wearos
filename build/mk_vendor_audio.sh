@@ -25,6 +25,15 @@ cp "$XML" $M/etc/audio_policy_configuration.xml
 chmod 644 $M/etc/audio_policy_configuration.xml
 setfattr -n security.selinux -v u:object_r:vendor_configs_file:s0 $M/etc/audio_policy_configuration.xml
 
+XMLDIR=$(dirname "$XML")
+for vf in audio_policy_volumes.xml default_volume_tables.xml; do
+    if [ -f "$XMLDIR/$vf" ]; then
+        cp "$XMLDIR/$vf" "$M/etc/$vf"
+        chmod 644 "$M/etc/$vf"
+        setfattr -n security.selinux -v u:object_r:vendor_configs_file:s0 "$M/etc/$vf"
+    fi
+done
+
 P=$M/build.prop
 sed -i 's/^ro.hardware.audio.primary=.*/ro.hardware.audio.primary=r800/' $P
 grep -q '^ro.hardware.audio.primary=' $P || echo 'ro.hardware.audio.primary=r800' >> $P
