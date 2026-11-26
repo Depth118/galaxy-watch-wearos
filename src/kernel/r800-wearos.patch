@@ -26232,33 +26232,79 @@ index f1778003f..99b6216d9 100644
  
  int exynos_prepare_sys_powerdown(enum sys_powerdown mode)
 diff --git a/drivers/tty/serial/samsung.c b/drivers/tty/serial/samsung.c
-index c8a220d15..49ce04e8d 100644
+index c8a220d15..056d25ca4 100644
 --- a/drivers/tty/serial/samsung.c
 +++ b/drivers/tty/serial/samsung.c
-@@ -1775,6 +1775,11 @@ static int s3c24xx_serial_init_port(struct s3c24xx_uart_port *ourport,
+@@ -105,6 +105,9 @@ static void dbg(const char *fmt, ...)
+ #define BT_UART_TRACE 1
+ #define PROC_DIR	"bluetooth/uart"
+ #define BLUETOOTH_UART_PORT_LINE 1
++
++/* UINTP bits this driver never services */
++#define S3C64XX_UINTP_UNHANDLED	(S3C64XX_UINTM_ERR_MSK | S3C64XX_UINTM_MODEM_MSK)
+ /* macros to change one thing to another */
  
+ #define tx_enabled(port) ((port)->unused[0])
+@@ -817,6 +820,7 @@ static irqreturn_t s3c64xx_serial_handle
+ 	struct s3c24xx_uart_port *ourport = id;
+ 	struct uart_port *port = &ourport->port;
+ 	irqreturn_t ret = IRQ_HANDLED;
++	u32 pend;
+ 
+ #ifdef CONFIG_PM_DEVFREQ
+ 	if ((ourport->mif_qos_val || ourport->cpu_qos_val)
+@@ -831,6 +835,18 @@ static irqreturn_t s3c64xx_serial_handle
+ 	if (rd_regl(port, S3C64XX_UINTP) & S3C64XX_UINTM_TXD_MSK)
+ 		ret = s3c24xx_serial_tx_chars(irq, id);
+ 
++	/*
++	 * This driver never unmasks ERROR or MODEM, yet their UINTP bits can
++	 * be found set: on the SM-R800 Bluetooth port MODEM was pending after
++	 * every system resume (UINTP=0x8 with UINTM=0xe). The interrupt kept
++	 * firing although UINTM masks MODEM, nothing else clears these bits,
++	 * and the threaded handler ran back to back (~200k irq/s) until the
++	 * watchdog fired. Clear them here.
++	 */
++	pend = rd_regl(port, S3C64XX_UINTP) & S3C64XX_UINTP_UNHANDLED;
++	if (pend)
++		wr_regl(port, S3C64XX_UINTP, pend);
++
+ 	return ret;
+ }
+ 
+@@ -998,6 +1014,8 @@ static int s3c64xx_serial_startup(struct
+ 
+ 	spin_lock_irqsave(&port->lock, flags);
+ 	wr_regl(port, S3C64XX_UINTM, 0xf);
++	/* drop ERROR/MODEM bits that latched while the port was down or reset */
++	wr_regl(port, S3C64XX_UINTP, S3C64XX_UINTP_UNHANDLED);
+ 	spin_unlock_irqrestore(&port->lock, flags);
+ 
+ 	if (ourport->use_default_irq == 1)
+@@ -1776,6 +1794,11 @@ static int s3c24xx_serial_init_port(stru
  	snprintf(clkname, sizeof(clkname), "ipclk_uart%d", ourport->port.line);
  	ourport->clk = devm_clk_get(&platdev->dev, clkname);
-+	if (IS_ERR(ourport->clk)) {
+ 	if (IS_ERR(ourport->clk)) {
 +		/* SM-R800: the Tizen (3.18) device tree names it gate_uartN */
 +		snprintf(clkname, sizeof(clkname), "gate_uart%d", ourport->port.line);
 +		ourport->clk = devm_clk_get(&platdev->dev, clkname);
 +	}
- 	if (IS_ERR(ourport->clk)) {
++	if (IS_ERR(ourport->clk)) {
  		pr_err("%s: Controller clock not found\n",
  				dev_name(&platdev->dev));
-@@ -1784,6 +1789,11 @@ static int s3c24xx_serial_init_port(struct s3c24xx_uart_port *ourport,
- 	if (ourport->check_separated_clk) {
+ 		return PTR_ERR(ourport->clk);
+@@ -1785,6 +1808,11 @@ static int s3c24xx_serial_init_port(stru
  		snprintf(clkname, sizeof(clkname), "gate_uart_clk%d", ourport->port.line);
  		ourport->separated_clk = devm_clk_get(&platdev->dev, clkname);
-+		if (IS_ERR(ourport->separated_clk)) {
+ 		if (IS_ERR(ourport->separated_clk)) {
 +			/* SM-R800 Tizen device tree: gate_pclkN */
 +			snprintf(clkname, sizeof(clkname), "gate_pclk%d", ourport->port.line);
 +			ourport->separated_clk = devm_clk_get(&platdev->dev, clkname);
 +		}
- 		if (IS_ERR(ourport->separated_clk)) {
++		if (IS_ERR(ourport->separated_clk)) {
  			pr_err("%s: Controller clock not found\n",
  					dev_name(&platdev->dev));
+ 			return PTR_ERR(ourport->separated_clk);
 diff --git a/drivers/video/fbdev/exynos/dpu30/Kconfig b/drivers/video/fbdev/exynos/dpu30/Kconfig
 index 68310e17b..67ce20da2 100644
 --- a/drivers/video/fbdev/exynos/dpu30/Kconfig
@@ -28254,6 +28300,19 @@ index 000000000..a30486a1d
 +void destroy_sensor_class(void);
 +
 +#endif
+diff --git a/include/linux/serial_s3c.h b/include/linux/serial_s3c.h
+index b19070cc7..13b3b527e 100644
+--- a/include/linux/serial_s3c.h
++++ b/include/linux/serial_s3c.h
+@@ -216,6 +216,8 @@
+ #define S3C64XX_UINTM_RXD_MSK	(1 << S3C64XX_UINTM_RXD)
+ #define S3C64XX_UINTM_ERR_MSK   (1 << S3C64XX_UINTM_ERROR)
+ #define S3C64XX_UINTM_TXD_MSK	(1 << S3C64XX_UINTM_TXD)
++#define S3C64XX_UINTM_MODEM	(3)
++#define S3C64XX_UINTM_MODEM_MSK	(1 << S3C64XX_UINTM_MODEM)
+ 
+ /* Following are specific to S5PV210 */
+ #define S5PV210_UCON_CLKMASK	(1<<10)
 diff --git a/include/linux/ssp_platformdata.h b/include/linux/ssp_platformdata.h
 new file mode 100644
 index 000000000..204602d35
